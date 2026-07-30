@@ -1,0 +1,48 @@
+{
+  "frozen_at": "2026-07-30T23:08:57+00:00",
+  "break": "first print >=1 tick beyond H/L, inside->outside transition, window 18:00:30-18:15:30 ET",
+  "k": 1.0,
+  "e_floor_ticks": 8,
+  "r30_min_ticks": 4,
+  "min_prints_watch": 200,
+  "x_timeout_s": 30.0,
+  "x_formula": "clamp(5*round(P90(NQ pooled re-entry times <=120s)/5), 30, 90)",
+  "x_n_reentries": 2643,
+  "entry": "break print px + 3 ticks adverse (2 spread + 1 slip)",
+  "commission_rt": {
+    "NQ": 4.5,
+    "MNQ": 1.5
+  },
+  "stop": "opposite candle extreme",
+  "brackets": [
+    1,
+    2
+  ],
+  "tie_rule": "stop wins",
+  "time_stop": "18:30:00 ET",
+  "horizons_min": [
+    1,
+    2,
+    5,
+    15
+  ],
+  "g0": "PASS iff oracle net expectancy/trade > 0 in >=1 bracket view on NQ",
+  "phase1_grid": {
+    "hold_s": [
+      0,
+      2,
+      5,
+      10,
+      20,
+      30
+    ],
+    "ext_r30": [
+      0,
+      0.25,
+      0.5,
+      1.0
+    ]
+  },
+  "phase1_split": "chronological 60/40",
+  "phase1_metric": "expectancy per session in R, 1R bracket view"
+}
