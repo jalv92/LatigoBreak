@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+research/out/
+research/data/
+*.pkl
+*.csv.gz
