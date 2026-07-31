@@ -425,7 +425,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Min R30 ticks", Description = "Skip the session if the opening candle range is smaller (degenerate).", GroupName = "01. Signal", Order = 6)]
         public int MinR30Ticks { get; set; }
 
-        [NinjaScriptProperty, Range(1, 10)]
+        [NinjaScriptProperty, Range(1, 100)]
         [Display(Name = "Contracts", GroupName = "02. Trade", Order = 0)]
         public int Contracts { get; set; }
 
