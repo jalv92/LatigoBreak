@@ -20,7 +20,8 @@ Opening-range breakout strategy for the **18:00 ET Globex reopen** (NQ/MNQ, Ninj
 1. Copy `LatigoBreakStrategy.cs` to `Documents/NinjaTrader 8/bin/Custom/Strategies/` and compile (F5).
 2. Apply to an NQ/MNQ chart whose trading-hours template is **ETH/24-7** (the session must BEGIN at the 18:00 ET reopen; an RTH template silently makes it trade the 9:30 open). A 30-second chart is recommended for the visuals; the logic runs on its own 1-tick series.
 3. Strategy Analyzer runs require Order Fill Resolution **High / Tick / 1**.
-4. Defaults = best research cell (hold 30 s, extension 0.25×R30, 1 trade/session, 1R bracket, time stop 18:30). `Use whipsaw filter = false` reproduces the naive chase — useful in Playback to watch the filter earn its keep.
+4. Signal defaults = best research cell (hold 30 s, extension 0.25×R30, 1 trade/session, time stop 18:30). `Use whipsaw filter = false` reproduces the naive chase — useful in Playback to watch the filter earn its keep.
+5. **Trade management (v2, BigPrints-pattern):** stop = 2×ATR and target = 2×ATR (Wilder ATR on the primary chart series — the chart timeframe defines the ATR's meaning; both multipliers adjustable). Optional breakeven once price covers a % of the entry→target run (default 50%, off by default, offset in ticks). Real-time daily profit target / loss limit in USD (realized + unrealized; hit ⇒ flatten + lockout until next session). `Account-wide (all markets)` = the BigPrints shared governor: every LatigoBreak instance on the account flattens together on a combined breach (default OFF).
 
 ### Playback checklist
 
