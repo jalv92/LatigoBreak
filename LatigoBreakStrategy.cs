@@ -60,6 +60,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int _maxExt;                        // ticks beyond level (cumulative)
 
         private int _trades, _tag;
+        private int _lastXBar = -1, _lastDotBar = -1;   // one ✕ / one dot per primary bar
         private bool _entryPending, _timeExitSent, _flattenPending;
         private readonly List<string> _drawTags = new List<string>();
 
@@ -165,6 +166,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             _side = 0; _level = 0; _breakPx = 0; _maxExt = 0;
             _tBreak = DateTime.MinValue;
             _trades = 0;
+            _lastXBar = -1; _lastDotBar = -1;
             _entryPending = false;
             _timeExitSent = false;
             _flattenPending = false;
@@ -268,8 +270,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (reIn)
                 {
                     int oldSide = _side;
-                    double retS = (t - _tBreak).TotalSeconds;
-                    DrawWhipsaw(t, px, retS, oldSide);
+                    DrawWhipsaw(t, px, oldSide);
                     _phase = Phase.Armed;
                     _side = 0;
                     // Gap-through: same print already beyond the OPPOSITE level
@@ -305,12 +306,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             _phase = Phase.Armed;
             _insidePrev = true;
+            Print($"{Name}: candle frozen H={_h} L={_l} R30={_r30}t");
             if (ShowDrawings && ChartControl != null)
             {
                 DateTime end = _t0.AddSeconds(WatchEndSeconds);
                 Draw.Line(this, Tag($"LB_H_{_tag}"), false, _t0, _h, end, _h, Brushes.OrangeRed, DashStyleHelper.Solid, 2);
                 Draw.Line(this, Tag($"LB_L_{_tag}"), false, _t0, _l, end, _l, Brushes.OrangeRed, DashStyleHelper.Solid, 2);
-                Draw.Text(this, Tag($"LB_R_{_tag}"), $"R30={_r30}t", 0, _h + 4 * TickSize);
             }
         }
 
@@ -337,9 +338,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             _breakPx = px;
             _maxExt = ExtTicks(px);
             _phase = Phase.Active;
-            if (ShowDrawings && ChartControl != null)
-                Draw.Dot(this, Tag($"LB_B_{_tag}_{t.Ticks}"), false, t, px,
+            if (ShowDrawings && ChartControl != null && CurrentBars[0] != _lastDotBar)
+            {
+                _lastDotBar = CurrentBars[0];        // one break dot per primary bar
+                Draw.Dot(this, Tag($"LB_B_{_tag}_{_lastDotBar}"), false, t, px,
                          side > 0 ? Brushes.DodgerBlue : Brushes.Magenta);
+            }
             // hold=0 configs (or filter off) can confirm on the break print itself
             if (ConfirmReady(t))
                 SubmitEntry(t, px);
@@ -639,12 +643,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             return Math.Max(hl, Math.Max(hc, lc));
         }
 
-        private void DrawWhipsaw(DateTime t, double px, double retS, int side)
+        private void DrawWhipsaw(DateTime t, double px, int side)
         {
-            if (!ShowDrawings || ChartControl == null)
+            // One ✕ per primary bar, no text — dozens of sub-second whipsaws can
+            // land inside a single candle and pile into an unreadable smear.
+            if (!ShowDrawings || ChartControl == null || CurrentBars[0] == _lastXBar)
                 return;
+            _lastXBar = CurrentBars[0];
             double y = side > 0 ? px + 6 * TickSize : px - 6 * TickSize;
-            Draw.Text(this, Tag($"LB_W_{_tag}_{t.Ticks}"), $"✕ {retS:0.0}s", 0, y, Brushes.Red);
+            Draw.Text(this, Tag($"LB_W_{_tag}_{_lastXBar}"), "✕", 0, y, Brushes.Red);
         }
 
         private void DrawNote(DateTime t, double y, string msg)
