@@ -160,7 +160,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool _confirmLogged;                 // one confirm record per episode
         private string _entryVia = "v3";             // confirm | trigger | v3
         private bool _noTapeWarned;
-        private bool _expectTargetCancel;            // one-shot: BE's OCO cancel-replace of the target
+
+        // Live bracket-order references: any Cancelled event whose order is NOT
+        // the current reference is an echo of one of our own cancel-replaces
+        // (BE re-price, partial-fill resize) — never a hand-cancel. Genuine
+        // cancels are judged 1 s later so OCO cancels racing a closing fill
+        // don't read as hand-cancels either.
+        private Order _stopOrder, _targetOrder;
+        private DateTime _stopCancelAt = DateTime.MinValue, _targetCancelAt = DateTime.MinValue;
 
         // Forward outcome tracker: multi-slot (the BigPrints single-slot lesson),
         // MFE/MAE checkpoints at 30/60/120 s, closed at 600 s or on session reset.
@@ -271,7 +278,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             _flattenPending = false;
             _targetPx = 0; _stopPx = 0;
             _beApplied = false;
-            _expectTargetCancel = false;
+            _stopOrder = null; _targetOrder = null;
+            _stopCancelAt = DateTime.MinValue; _targetCancelAt = DateTime.MinValue;
             _dailyLockout = false;
             _dayStartRealized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
 
@@ -356,6 +364,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             // stop/target while later windows pass by unarmed.
             if (_phase == Phase.InPosition)
             {
+                CheckBracketCancels(t);
                 ManagePosition(px);
                 return;
             }
@@ -682,15 +691,37 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (Math.Abs(_targetPx - basePx) < TickSize)
                     _targetPx = Instrument.MasterInstrument.RoundToTickSize(basePx + _side * TickSize);
             }
+            // Null the refs BEFORE submitting: cancel-replace can echo the OLD
+            // orders' Cancelled events in-stack, and they must not match.
+            _stopOrder = null; _targetOrder = null;
             if (_side > 0)
             {
-                ExitLongStopMarket(0, true, qty, _stopPx, SigStop, SigLong);
-                ExitLongLimit(0, true, qty, _targetPx, SigTarget, SigLong);
+                _stopOrder = ExitLongStopMarket(0, true, qty, _stopPx, SigStop, SigLong);
+                _targetOrder = ExitLongLimit(0, true, qty, _targetPx, SigTarget, SigLong);
             }
             else
             {
-                ExitShortStopMarket(0, true, qty, _stopPx, SigStop, SigShort);
-                ExitShortLimit(0, true, qty, _targetPx, SigTarget, SigShort);
+                _stopOrder = ExitShortStopMarket(0, true, qty, _stopPx, SigStop, SigShort);
+                _targetOrder = ExitShortLimit(0, true, qty, _targetPx, SigTarget, SigShort);
+            }
+        }
+
+        // Deferred hand-cancel detector: a bracket Cancelled event only counts as
+        // "by hand" if the position is still open 1 s later — our own replaces
+        // never reach here (reference check) and closing-fill OCO cancels are
+        // cleared by the flat bookkeeping first.
+        private void CheckBracketCancels(DateTime t)
+        {
+            if (_stopCancelAt != DateTime.MinValue && (t - _stopCancelAt).TotalSeconds >= 1)
+            {
+                _stopCancelAt = DateTime.MinValue;
+                Print($"{Name}: LB_Stop cancelled by hand — position no longer protected on that side.");
+            }
+            if (_targetCancelAt != DateTime.MinValue && (t - _targetCancelAt).TotalSeconds >= 1)
+            {
+                _targetCancelAt = DateTime.MinValue;
+                _targetPx = 0;                       // respect the hand-cancel: BE must not resurrect it
+                Print($"{Name}: LB_Target cancelled by hand — take profit removed.");
             }
         }
 
@@ -719,22 +750,22 @@ namespace NinjaTrader.NinjaScript.Strategies
             // synchronously in-stack, and a stale tracker made the BE's own echo
             // print as "moved by hand" (observed 2026-08-02). The stop change is
             // also a cancel-replace under OCO, which killed the TARGET leg —
-            // re-submit it in the same breath (one-shot expected-cancel flag
-            // keeps the by-hand warning honest).
+            // re-submit it in the same breath; the nulled refs make the replaced
+            // orders' Cancelled echoes invisible to the by-hand warning.
             _stopPx = bePx;
             _beApplied = true;
-            _expectTargetCancel = _targetPx > 0;
+            _stopOrder = null; _targetOrder = null;
             if (_side > 0)
             {
-                ExitLongStopMarket(0, true, Position.Quantity, bePx, SigStop, SigLong);
+                _stopOrder = ExitLongStopMarket(0, true, Position.Quantity, bePx, SigStop, SigLong);
                 if (_targetPx > 0)
-                    ExitLongLimit(0, true, Position.Quantity, _targetPx, SigTarget, SigLong);
+                    _targetOrder = ExitLongLimit(0, true, Position.Quantity, _targetPx, SigTarget, SigLong);
             }
             else
             {
-                ExitShortStopMarket(0, true, Position.Quantity, bePx, SigStop, SigShort);
+                _stopOrder = ExitShortStopMarket(0, true, Position.Quantity, bePx, SigStop, SigShort);
                 if (_targetPx > 0)
-                    ExitShortLimit(0, true, Position.Quantity, _targetPx, SigTarget, SigShort);
+                    _targetOrder = ExitShortLimit(0, true, Position.Quantity, _targetPx, SigTarget, SigShort);
             }
             Print($"{Name}: breakeven armed at {bePx} ({BreakevenPercent}% of run covered).");
         }
@@ -884,7 +915,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _flattenPending = false;
                 _stopPx = 0; _targetPx = 0;
                 _beApplied = false;
-                _expectTargetCancel = false;
+                _stopOrder = null; _targetOrder = null;
+                _stopCancelAt = DateTime.MinValue; _targetCancelAt = DateTime.MinValue;
                 _freeSince = time;                   // gates arming of any window already open
                 if (FlowActive())
                     FlowLogTradeClose(time, n);
@@ -917,9 +949,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // Bracket orders: adopt the LIVE price so a hand-dragged stop/target
-            // keeps the breakeven guards honest; warn if one is cancelled by hand.
+            // keeps the breakeven guards honest. Events for orders that are not
+            // the CURRENT references are echoes of our own cancel-replaces
+            // (BE re-price, partial-fill resize) — ignored wholesale.
             if (order.Name == SigStop || order.Name == SigTarget)
             {
+                if (!ReferenceEquals(order, _stopOrder) && !ReferenceEquals(order, _targetOrder))
+                    return;
                 if (orderState == OrderState.Working || orderState == OrderState.Accepted)
                 {
                     double p = order.Name == SigStop ? stopPrice : limitPrice;
@@ -934,16 +970,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                          && Position.MarketPosition != MarketPosition.Flat
                          && !_flattenPending && !_dailyLockout)
                 {
-                    if (order.Name == SigTarget && _expectTargetCancel)
-                    {
-                        _expectTargetCancel = false; // BE's OCO cancel-replace — target re-submitted, not hand-cancelled
-                    }
-                    else
-                    {
-                        if (order.Name == SigTarget)
-                            _targetPx = 0;           // respect the hand-cancel: BE must not resurrect it
-                        Print($"{Name}: {order.Name} cancelled by hand — position no longer protected on that side.");
-                    }
+                    // Judged 1 s later in CheckBracketCancels: if the trade is
+                    // closing (OCO cancel racing the exit fill) the flat
+                    // bookkeeping clears this before it ever prints.
+                    if (order.Name == SigStop) _stopCancelAt = time;
+                    else _targetCancelAt = time;
                 }
                 return;
             }
