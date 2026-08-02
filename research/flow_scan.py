@@ -33,7 +33,7 @@ TRIGGER_GRACE_S = 5              # cluster firing this soon after the break = Tr
 
 
 def clusters(a):
-    """All finalized sweep clusters [(t_end, side, vol)], exact NT8 fold rules."""
+    """All finalized sweep clusters [(t_end, side, vol, max_print)], NT8 fold rules."""
     m = a["side"] != 0
     ts, side, vol = a["ts"][m], a["side"][m], a["vol"][m]
     out = []
@@ -41,42 +41,45 @@ def clusters(a):
         return out
     c_start = c_last = int(ts[0])
     c_side = int(side[0])
-    c_vol = int(vol[0])
+    c_vol = c_mp = int(vol[0])
     for i in range(1, len(ts)):
         t, s, v = int(ts[i]), int(side[i]), int(vol[i])
         if (s == c_side and t - c_last <= GAP_MS * NET_MS
                 and t - c_start <= SPAN_MS * NET_MS):
             c_vol += v
+            c_mp = max(c_mp, v)
             c_last = t
             continue
-        out.append((c_last, c_side, c_vol))
+        out.append((c_last, c_side, c_vol, c_mp))
         c_start = c_last = t
-        c_side, c_vol = s, v
-    out.append((c_last, c_side, c_vol))
+        c_side, c_vol, c_mp = s, v, v
+    out.append((c_last, c_side, c_vol, c_mp))
     return out
 
 
-def support(cls, ev, thr):
+def support(cls, ev, thr, mp_min=0):
     """(supported_pre, trigger) mirroring the NT8 verdict.
 
     supported_pre: same-side cluster volume >= thr AND >= opposite volume in
     the 120 s before the break. trigger: first same-side cluster >= thr that
     fires within TRIGGER_GRACE_S after the break (balance re-checked then),
-    returned as its (t_end, same_vol, opp_vol) or None.
+    returned as its (t_end, same_vol, opp_vol) or None. mp_min mirrors
+    SupportMinMaxPrint: clusters whose largest single print is smaller are
+    invisible to the verdict.
     """
     lo = ev.t_break - SUPPORT_WINDOW_S * corpus.NET_S
     same = opp = 0
-    for t_end, side, vol in cls:
-        if lo <= t_end <= ev.t_break and vol >= thr:
+    for t_end, side, vol, mp in cls:
+        if lo <= t_end <= ev.t_break and vol >= thr and mp >= mp_min:
             if side == ev.side:
                 same += vol
             else:
                 opp += vol
     pre = same >= thr and same >= opp
     trig = None
-    for t_end, side, vol in cls:
+    for t_end, side, vol, mp in cls:
         if ev.t_break < t_end <= ev.t_break + TRIGGER_GRACE_S * corpus.NET_S \
-                and vol >= thr:
+                and vol >= thr and mp >= mp_min:
             if side == ev.side:
                 s2 = same + vol
                 if s2 >= thr and s2 >= opp:
@@ -130,8 +133,9 @@ def main():
              "Aggressor side = bid/ask HEURISTIC (corr +0.52) — NT8 tape is ground truth. "
              "18:00 tramo is burned (Phase 0/1) — **calibration-only numbers.**", ""]
     for inst in ("NQ", "MNQ"):
-        rows = {t: dict(sup=[], unsup=[], mfe_s=[], mfe_u=[], trig={1: [], 2: []})
-                for t in THRESHOLDS}
+        combos = [(t, 0) for t in THRESHOLDS] + [(60, mp) for mp in (3, 5, 8, 10, 15, 20)]
+        rows = {c: dict(sup=[], unsup=[], mfe_s=[], mfe_u=[], trig={1: [], 2: []})
+                for c in combos}
         n_sess = 0
         for d in sorted(corpus.sessions(inst)):
             a = corpus.load_session(inst, d)
@@ -147,19 +151,20 @@ def main():
             h, l, _r30 = fc
             n_sess += 1
             cls = clusters(a)
-            for thr in THRESHOLDS:
+            for combo in combos:
+                thr, mp = combo
                 trig_taken = False
                 for ev in evs:
-                    pre, trig = support(cls, ev, thr)
+                    pre, trig = support(cls, ev, thr, mp)
                     is_sup = pre or trig is not None
                     real = ev.label == "real"
-                    (rows[thr]["sup"] if is_sup else rows[thr]["unsup"]).append(real)
+                    (rows[combo]["sup"] if is_sup else rows[combo]["unsup"]).append(real)
                     mfe = float(np.max(
                         (a["px"][(a["ts"] > ev.t_break)
                                  & (a["ts"] <= ev.t_break + 120 * corpus.NET_S)]
                          - ev.break_px) * ev.side / corpus.TICK_SIZE, initial=0.0))
-                    (rows[thr]["mfe_s"] if is_sup else rows[thr]["mfe_u"]).append(mfe)
-                    # first Trigger-style entry per session per threshold
+                    (rows[combo]["mfe_s"] if is_sup else rows[combo]["mfe_u"]).append(mfe)
+                    # first Trigger-style entry per session per combo
                     if trig is not None and not trig_taken:
                         trig_taken = True
                         i_entry = int(np.searchsorted(a["ts"], trig[0], side="left"))
@@ -169,17 +174,19 @@ def main():
                             t = sim_bracket_at(a, i_entry, ev.side, px_entry,
                                                h, l, rr, inst, t0)
                             if t:
-                                rows[thr]["trig"][rr].append(t)
+                                rows[combo]["trig"][rr].append(t)
         lines += [f"## {inst} ({n_sess} sessions)", ""]
-        for thr in THRESHOLDS:
-            r = rows[thr]
+        for combo in combos:
+            thr, mp = combo
+            r = rows[combo]
             ns, nu = len(r["sup"]), len(r["unsup"])
             ks, ku = sum(r["sup"]), sum(r["unsup"])
             rs = 100 * ks / ns if ns else float("nan")
             ru = 100 * ku / nu if nu else float("nan")
             z = z_two_prop(ks, ns, ku, nu)
+            label = f"threshold {thr}c" + (f" + max-print >= {mp}c" if mp else "")
             lines.append(
-                f"### threshold {thr}c — supported {ns}/{ns + nu} breaks "
+                f"### {label} — supported {ns}/{ns + nu} breaks "
                 f"({100 * ns / max(1, ns + nu):.0f}%)")
             lines.append(
                 f"- real-rate: supported **{rs:.1f}%** ({ks}/{ns}) vs "
