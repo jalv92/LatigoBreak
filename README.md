@@ -1,6 +1,6 @@
 # LatigoBreak
 
-Opening-range breakout strategy for the **18:00 ET Globex reopen** (NQ/MNQ, NinjaTrader 8), built around one core problem: detecting **whipsaws** — breaks of the first 30-second candle that snap back inside the range — and refusing to trade them.
+Opening-range breakout strategy (NQ/MNQ, NinjaTrader 8) built around one core problem: detecting **whipsaws** — breaks of the first 30-second candle that snap back inside the range — and refusing to trade them. Originally researched on the **18:00 ET Globex reopen**; the NT8 lab (v3) can hunt the same setup at up to three session windows per trading day (18:00 / 20:00 / 09:30 ET).
 
 ## Status
 
@@ -18,20 +18,23 @@ Opening-range breakout strategy for the **18:00 ET Globex reopen** (NQ/MNQ, Ninj
 ## NT8 usage
 
 1. Copy `LatigoBreakStrategy.cs` to `Documents/NinjaTrader 8/bin/Custom/Strategies/` and compile (F5).
-2. Apply to an NQ/MNQ chart whose trading-hours template is **ETH/24-7** (the session must BEGIN at the 18:00 ET reopen; an RTH template silently makes it trade the 9:30 open). A 30-second chart is recommended for the visuals; the logic runs on its own 1-tick series.
+2. Apply to an NQ/MNQ chart whose trading-hours template is **CME ETH** (the session must BEGIN at the 18:00 ET reopen — the three windows are fixed offsets from the session begin, so an RTH template silently misplaces every window). A 30-second chart is recommended for the visuals; the logic runs on its own 1-tick series.
 3. Strategy Analyzer runs require Order Fill Resolution **High / Tick / 1**.
-4. Signal defaults = best research cell (hold 30 s, extension 0.25×R30, 1 trade/session, time stop 18:30). `Use whipsaw filter = false` reproduces the naive chase — useful in Playback to watch the filter earn its keep.
-5. **Trade management (v2, BigPrints-pattern):** stop = 2×ATR and target = 2×ATR (Wilder ATR on the primary chart series — the chart timeframe defines the ATR's meaning; both multipliers adjustable). Optional breakeven once price covers a % of the entry→target run (default 50%, off by default, offset in ticks). Real-time daily profit target / loss limit in USD (realized + unrealized; hit ⇒ flatten + lockout until next session). `Account-wide (all markets)` = the BigPrints shared governor: every LatigoBreak instance on the account flattens together on a combined breach (default OFF).
+4. **Session windows (v3):** three per trading day, each with its own checkbox — 18:00 ET Globex reopen, 20:00 ET, 09:30 ET US open (all ON by default). Each window hunts breaks/entries for `Entry window (minutes)` (default 30) after it opens. **An open position is never closed by the clock** — it runs to stop/target (outer bound: exit-on-session-close at the 17:00 ET halt). A window that opens while a position is still on is skipped. `Max trades per window` (default 1) re-arms inside the window after a completed trade.
+5. Signal defaults = best research cell (hold 30 s, extension 0.25×R30). `Use whipsaw filter = false` reproduces the naive chase — useful in Playback to watch the filter earn its keep.
+6. **Trade management:** initial stop = 2×ATR and target = 2×ATR (Wilder ATR on the primary chart series — the chart timeframe defines the ATR's meaning; both multipliers adjustable), priced off the actual fill. **Brackets are hand-draggable (v3):** they are live-until-cancelled Exit orders (`LB_Stop` / `LB_Target`), not Set* orders, so moving them in Chart Trader sticks — the strategy adopts your move (Output window logs it) and never snaps them back. Cancelling one by hand leaves that side unprotected (logged, your call). Optional breakeven once price covers a % of the entry→target run (default 50%, off by default; when it triggers it overrides a hand-dragged stop once). Real-time daily profit target / loss limit in USD (realized + unrealized; hit ⇒ flatten + lockout until next session). `Account-wide (all markets)` = the BigPrints shared governor: every LatigoBreak instance on the account flattens together on a combined breach (default OFF).
 
 ### Playback checklist
 
-1. Candle 18:00:00–18:00:30 drawn with H/L rays and `R30=Nt` label.
+1. Opening candle of each enabled window (first 30 s) drawn with H/L rays; `R30=Nt` in the Output window.
 2. First break beyond H/L marks a dot (blue up / magenta down).
-3. Snap-back inside prints a red `✕ n.ns` and the strategy re-arms (both sides).
-4. Confirmed break (30 s outside + 0.25×R30 extension) enters market with stop at the opposite extreme and 1R target; triangle at entry.
-5. No new breaks after 18:15:30; no entries after 18:20; open position flattens at 18:30.
-6. Rewind mid-session and replay: old drawings of the discarded pass are wiped, state resets cleanly, the session re-detects from scratch.
-7. Second session in the same Playback run resets counters (fresh candle, fresh trade budget).
+3. Snap-back inside prints a red `✕` and the strategy re-arms (both sides).
+4. Confirmed break (30 s outside + 0.25×R30 extension) enters market; stop/target brackets appear priced off the fill; triangle at entry.
+5. No new breaks or entries after `Entry window (minutes)`; an open position is NOT flattened by the clock.
+6. Drag the stop or target in Chart Trader: it stays where you put it and the Output window logs "moved by hand — adopted".
+7. Hold a position through the next window's open (e.g. entry 19:58, still open at 20:00): that window is skipped, the following one arms normally.
+8. Rewind mid-session and replay: old drawings of the discarded pass are wiped, state resets cleanly, the day re-detects from scratch.
+9. Second session in the same Playback run resets counters (fresh windows, fresh trade budgets).
 
 ## Method rules inherited from previous projects
 

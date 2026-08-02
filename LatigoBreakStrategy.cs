@@ -1,25 +1,38 @@
-// LatigoBreakStrategy — opening-range breakout of the first 30s candle at the
-// 18:00 ET Globex reopen, with whipsaw (fake-breakout) veto and re-arm.
+// LatigoBreakStrategy — opening-range breakout with whipsaw (fake-breakout)
+// veto, run at up to three session windows per trading day (v3):
+// 18:00 ET Globex reopen, 20:00 ET evening, 09:30 ET US open — each with its
+// own enable checkbox. Windows are OFFSETS from the ETH session begin, so the
+// strategy needs no time-zone code but REQUIRES a trading-hours template whose
+// session begins at the 18:00 ET reopen (CME ETH). An RTH template silently
+// misplaces every window.
 //
-// 1:1 port of the validated research engine (research/events.py +
-// research/phase1.confirm_index in this repo; the research label timeout X is
-// deliberately omitted live — the causal detector never used it). Signal
-// defaults = best Phase-1 grid cell (hold 30s, extension 0.25xR30).
+// Signal engine is the 1:1 port of the research detector (research/events.py +
+// research/phase1.confirm_index). Signal defaults = best Phase-1 grid cell
+// (hold 30s, extension 0.25xR30).
 // HONEST-USE NOTE: research on 203 NQ sessions shows the naive chase loses
 // ~$110/trade and the best filter cell stays slightly below zero — this
 // strategy is a Playback/sim laboratory for iterating the redesign, not a
 // validated edge (see docs/research/).
 //
-// v2 trade management (ported from the twice-audited BigPrintsStrategy.cs):
-// ATR brackets (stop = AtrStopMult x Wilder ATR on the PRIMARY chart series —
-// the chart timeframe defines the ATR's meaning), optional breakeven at a %
-// of the entry->target run, real-time daily profit/loss lockout, and an
-// optional account-wide shared governor so several instances (markets) all
-// flatten together on a combined breach (default OFF).
+// v3 changes (2026-08-02):
+// * Three windows with checkboxes; a window is skipped when a position (or a
+//   pending entry) is still open when its opening candle elapses.
+// * One EntryWindowMinutes clock (default 30) per window replaces watch-end /
+//   entry-deadline / time-stop: breaks and entries die 30 min after the window
+//   opens, but an OPEN POSITION IS NEVER CLOSED BY THE CLOCK — it runs to
+//   stop/target (outer bound: exit-on-session-close at the 17:00 ET halt).
+// * Brackets are live-until-cancelled Exit orders (LB_Stop / LB_Target)
+//   submitted on the entry fill — NOT Set* orders, which the strategy engine
+//   re-asserts. Result: a stop/target dragged by hand in Chart Trader STAYS
+//   where you put it. OnOrderUpdate adopts hand-moves into the internal state
+//   so the optional breakeven guards stay honest.
 //
-// Requires an ETH/24-7 trading-hours template (session must BEGIN at the
-// 18:00 ET reopen). Strategy Analyzer runs need Order Fill Resolution
-// High / Tick / 1.
+// v2 trade management retained: ATR brackets (Wilder ATR hand-rolled on the
+// PRIMARY chart series — the chart timeframe defines the ATR's meaning),
+// optional breakeven at a % of the entry->target run, real-time daily
+// profit/loss lockout, and the account-wide shared governor (default OFF).
+//
+// Strategy Analyzer runs need Order Fill Resolution High / Tick / 1.
 #region Using declarations
 using System;
 using System.Collections.Generic;
@@ -39,15 +52,28 @@ namespace NinjaTrader.NinjaScript.Strategies
 {
     public class LatigoBreakStrategy : Strategy
     {
-        private enum Phase { WaitSession, Candle, Armed, Active, Pending, InPosition, Done }
+        private enum Phase { Idle, Candle, Armed, Active, Pending, InPosition }
 
         private const int TickIdx = 1;
         private const string SigLong = "LB_Long";
         private const string SigShort = "LB_Short";
+        private const string SigStop = "LB_Stop";
+        private const string SigTarget = "LB_Target";
 
-        private Phase _phase = Phase.WaitSession;
+        // Session windows as seconds from the ETH session begin (18:00 ET):
+        // +0 = 18:00 reopen, +7200 = 20:00, +55800 = 09:30 next morning (same
+        // trading day). DST transitions always fall inside the closed weekend,
+        // so fixed offsets are exact.
+        private static readonly int[] WinOffsetSecs = { 0, 7200, 55800 };
+        private static readonly string[] WinNames = { "18:00", "20:00", "09:30" };
+
+        private Phase _phase = Phase.Idle;
         private SessionIterator _sess;
-        private DateTime _t0 = DateTime.MinValue;   // session begin (18:00 ET reopen)
+        private DateTime _t0 = DateTime.MinValue;   // trading-day session begin (18:00 ET)
+        private DateTime _w0 = DateTime.MinValue;   // active window begin
+        private double _wDeadlineSecs;              // effective entry window (capped, see TryArmWindow)
+        private int _nextWin;                       // next window index to consider
+        private DateTime _freeSince = DateTime.MinValue;    // when we last became flat+idle
         private DateTime _lastTick = DateTime.MinValue;
 
         private double _h = double.MinValue, _l = double.MaxValue;
@@ -59,9 +85,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime _tBreak;
         private int _maxExt;                        // ticks beyond level (cumulative)
 
-        private int _trades, _tag;
+        private int _trades, _tag;                  // per-window trade count / drawing tag
         private int _lastXBar = -1, _lastDotBar = -1;   // one ✕ / one dot per primary bar
-        private bool _entryPending, _timeExitSent, _flattenPending;
+        private bool _entryPending, _flattenPending;
         private readonly List<string> _drawTags = new List<string>();
 
         // ATR on the PRIMARY series (hand-rolled Wilder — nt8c cannot resolve the
@@ -69,7 +95,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Series<double> _atrSeries;
         private double _atrNow;                     // latest primary ATR, read from the tick branch
 
-        // Bracket/breakeven state for the open trade
+        // Bracket state for the open trade. _stopPx/_targetPx track the LIVE
+        // order prices (synced in OnOrderUpdate), not just what we submitted —
+        // hand-dragged orders update them too.
         private double _targetPx, _stopPx;
         private bool _beApplied;
 
@@ -97,7 +125,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Name = "LatigoBreakStrategy";
-                Description = "Opening 30s-candle breakout at the 18:00 ET reopen with whipsaw veto. Sim/Playback lab — see repo docs/research for the honest stats.";
+                Description = "Opening 30s-candle breakout with whipsaw veto at up to three session windows (18:00 / 20:00 / 09:30 ET). Sim/Playback lab — see repo docs/research for the honest stats.";
                 Calculate = Calculate.OnEachTick;
                 EntriesPerDirection = 1;
                 IsExitOnSessionCloseStrategy = true;
@@ -105,20 +133,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                 BarsRequiredToTrade = 0;
                 IsInstantiatedOnEachOptimizationIteration = false;
 
+                TradeGlobexReopen = true;
+                TradeEvening = true;
+                TradeUsOpen = true;
+                EntryWindowMinutes = 30;
+
                 UseWhipsawFilter = true;
                 HoldSeconds = 30;
                 ExtensionR30 = 0.25;
                 CandleSeconds = 30;
-                WatchEndSeconds = 930;
-                EntryDeadlineSeconds = 1200;
                 MinR30Ticks = 4;
 
                 Contracts = 1;
                 AtrPeriod = 14;
                 AtrStopMult = 2.0;
                 AtrTargetMult = 2.0;
-                MaxTradesPerSession = 1;
-                TimeStopSeconds = 1800;
+                MaxTradesPerWindow = 1;
 
                 UseBreakeven = false;
                 BreakevenPercent = 50;
@@ -153,22 +183,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 foreach (string tag in _drawTags)
                     RemoveDrawObject(tag);
+                // Only the rewind path clears the ledger: tags must accumulate
+                // across session rollovers so a cross-day rewind can wipe the
+                // WHOLE discarded pass, not just its last session.
+                _drawTags.Clear();
                 // Rewind also discards the pass that may have set the shared breach flag
                 if (Account != null)
                     lock (_acctGovLock) _acctGov.Remove(Account.Name);
             }
-            _drawTags.Clear();
 
-            _phase = Phase.WaitSession;
-            _h = double.MinValue; _l = double.MaxValue;
-            _r30 = 0;
-            _insidePrev = true;
-            _side = 0; _level = 0; _breakPx = 0; _maxExt = 0;
-            _tBreak = DateTime.MinValue;
-            _trades = 0;
-            _lastXBar = -1; _lastDotBar = -1;
+            _phase = Phase.Idle;
+            _nextWin = 0;
+            _w0 = DateTime.MinValue;
+            _freeSince = DateTime.MinValue;
+            ResetWindowState();
             _entryPending = false;
-            _timeExitSent = false;
             _flattenPending = false;
             _targetPx = 0; _stopPx = 0;
             _beApplied = false;
@@ -176,10 +205,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             _dayStartRealized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
         }
 
+        private void ResetWindowState()
+        {
+            _h = double.MinValue; _l = double.MaxValue;
+            _r30 = 0;
+            _insidePrev = true;
+            _side = 0; _level = 0; _breakPx = 0; _maxExt = 0;
+            _tBreak = DateTime.MinValue;
+            _trades = 0;
+            _lastXBar = -1; _lastDotBar = -1;
+        }
+
         private string Tag(string t)
         {
             _drawTags.Add(t);
             return t;
+        }
+
+        private bool WinEnabled(int i)
+        {
+            if (i == 0) return TradeGlobexReopen;
+            if (i == 1) return TradeEvening;
+            return TradeUsOpen;
         }
 
         protected override void OnBarUpdate()
@@ -208,28 +255,37 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ResetSession(false);
                 _sess.GetNextSession(t, true);
                 _t0 = _sess.ActualSessionBegin;
-                _tag++;
-                _phase = Phase.Candle;
                 _acctSessionDay = _t0.Date;
                 if (UseAccountDailyPnL)
                     CurrentAccountDay();             // prime the shared baseline for this day
             }
+            if (_t0 == DateTime.MinValue)
+                return;
 
-            if (_t0 != DateTime.MinValue)
-                CheckRiskGovernor();                 // real-time daily limits — runs in EVERY phase
+            CheckRiskGovernor();                     // real-time daily limits — runs in EVERY phase
 
-            if (_phase == Phase.WaitSession || _phase == Phase.Done || _t0 == DateTime.MinValue)
+            // An open position is never closed by the clock (v3): it runs to
+            // stop/target while later windows pass by unarmed.
+            if (_phase == Phase.InPosition)
             {
-                CheckTimeStop(t);
+                ManagePosition(px);
                 return;
             }
+            if (_phase == Phase.Pending)
+                return;
 
-            double secs = (t - _t0).TotalSeconds;
+            if (_phase == Phase.Idle)
+            {
+                TryArmWindow(t);
+                if (_phase == Phase.Idle)
+                    return;
+            }
+
+            double secs = (t - _w0).TotalSeconds;
+            double deadline = _wDeadlineSecs;
 
             if (_phase == Phase.Candle)
             {
-                if (secs < 0)
-                    return;                          // pre-session jitter (parity with t0 <= ts window)
                 if (secs < CandleSeconds)
                 {
                     if (px > _h) _h = px;
@@ -237,24 +293,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
                 FreezeCandle();
-                if (_phase == Phase.Done)
-                    return;                          // degenerate / empty candle
+                if (_phase == Phase.Idle)
+                    return;                          // degenerate / empty candle — window consumed
             }
 
-            // Global session clocks
-            if (_phase == Phase.Armed || _phase == Phase.Active)
+            if (secs > deadline)                     // Armed/Active past the entry window
             {
-                if (secs > EntryDeadlineSeconds)     // no more entries this session
-                {
-                    _phase = Phase.Done;
-                    return;
-                }
-            }
-            CheckTimeStop(t);
-            if (_phase == Phase.InPosition)
-                ManagePosition(px);
-            if (_phase == Phase.Pending || _phase == Phase.InPosition || _phase == Phase.Done)
+                ConsumeWindow("entry window over");
                 return;
+            }
 
             bool up = px >= _h + TickSize * 0.5;
             bool dn = px <= _l - TickSize * 0.5;
@@ -275,7 +322,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     _side = 0;
                     // Gap-through: same print already beyond the OPPOSITE level
                     bool beyondOpp = oldSide > 0 ? dn : up;
-                    if (beyondOpp && secs <= WatchEndSeconds)
+                    if (beyondOpp)
                         OpenBreak(t, px, -oldSide);
                 }
                 else if (ConfirmReady(t))
@@ -284,24 +331,83 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            if (_phase == Phase.Armed && _insidePrev && (up || dn) && secs <= WatchEndSeconds)
+            if (_phase == Phase.Armed && _insidePrev && (up || dn))
                 OpenBreak(t, px, up ? 1 : -1);
 
             _insidePrev = inside;
+        }
+
+        // When idle and flat, skip disabled windows and windows we were not
+        // already free for at their open (in a trade / pending entry = "skip
+        // the next opening" — and it also prevents silently-truncated opening
+        // candles), then arm the current one once its time comes.
+        private void TryArmWindow(DateTime t)
+        {
+            if (_dailyLockout || _entryPending || Position.MarketPosition != MarketPosition.Flat)
+                return;
+            while (_nextWin < WinOffsetSecs.Length)
+            {
+                DateTime w0 = _t0.AddSeconds(WinOffsetSecs[_nextWin]);
+                if (!WinEnabled(_nextWin) || t >= w0.AddSeconds(CandleSeconds) || _freeSince > w0)
+                {
+                    _nextWin++;
+                    continue;
+                }
+                if (t < w0)
+                    return;                          // upcoming — keep waiting
+                _w0 = w0;
+                _wDeadlineSecs = EffectiveDeadlineSecs();
+                _tag++;
+                ResetWindowState();
+                _phase = Phase.Candle;
+                Print($"{Name}: window {WinNames[_nextWin]} armed ({w0:HH:mm:ss} chart time).");
+                // Only reachable when the strategy was ENABLED mid-candle (a
+                // position never overlaps here — _freeSince gates that): the
+                // opening range is built from a partial tick sample. Disclose.
+                if ((t - w0).TotalSeconds > 1)
+                    Print($"{Name}: armed {(t - w0).TotalSeconds:F0}s late — opening candle is PARTIAL.");
+                return;
+            }
+        }
+
+        // Configured entry window, floored so the candle can never starve the
+        // hunt (CandleSeconds + 60s minimum) and capped at the next ENABLED
+        // window's open so one window's hunt can never swallow the next.
+        private double EffectiveDeadlineSecs()
+        {
+            double configured = EntryWindowMinutes * 60.0;
+            double want = Math.Max(configured, CandleSeconds + 60.0);
+            for (int j = _nextWin + 1; j < WinOffsetSecs.Length; j++)
+            {
+                if (!WinEnabled(j))
+                    continue;
+                want = Math.Min(want, WinOffsetSecs[j] - WinOffsetSecs[_nextWin]);
+                break;
+            }
+            if (Math.Abs(want - configured) > 0.5)
+                Print($"{Name}: effective entry window {want:F0}s (configured {configured:F0}s — floored by candle / capped by next window).");
+            return want;
+        }
+
+        private void ConsumeWindow(string reason)
+        {
+            Print($"{Name}: window {WinNames[Math.Min(_nextWin, WinNames.Length - 1)]} closed — {reason}.");
+            _nextWin++;
+            _phase = Phase.Idle;
         }
 
         private void FreezeCandle()
         {
             if (_h == double.MinValue)               // no prints in the candle window
             {
-                _phase = Phase.Done;
+                ConsumeWindow("empty candle");
                 return;
             }
             _r30 = (int)Math.Round((_h - _l) / TickSize);
             if (_r30 < MinR30Ticks)
             {
                 DrawNote(_lastTick, _h + 4 * TickSize, $"LB degenerate R30={_r30}t — skipped");
-                _phase = Phase.Done;
+                ConsumeWindow("degenerate candle");
                 return;
             }
             _phase = Phase.Armed;
@@ -309,9 +415,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             Print($"{Name}: candle frozen H={_h} L={_l} R30={_r30}t");
             if (ShowDrawings && ChartControl != null)
             {
-                DateTime end = _t0.AddSeconds(WatchEndSeconds);
-                Draw.Line(this, Tag($"LB_H_{_tag}"), false, _t0, _h, end, _h, Brushes.OrangeRed, DashStyleHelper.Solid, 2);
-                Draw.Line(this, Tag($"LB_L_{_tag}"), false, _t0, _l, end, _l, Brushes.OrangeRed, DashStyleHelper.Solid, 2);
+                DateTime end = _w0.AddSeconds(_wDeadlineSecs);
+                Draw.Line(this, Tag($"LB_H_{_tag}"), false, _w0, _h, end, _h, Brushes.OrangeRed, DashStyleHelper.Solid, 2);
+                Draw.Line(this, Tag($"LB_L_{_tag}"), false, _w0, _l, end, _l, Brushes.OrangeRed, DashStyleHelper.Solid, 2);
             }
         }
 
@@ -353,36 +459,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (_dailyLockout)
             {
-                _phase = Phase.Done;
+                ConsumeWindow("daily lockout");
                 return;
             }
 
-            double atr = _atrNow;
-            double stopPx, targetPx;
-            if (atr > TickSize)
-            {
-                stopPx = Instrument.MasterInstrument.RoundToTickSize(px - _side * AtrStopMult * atr);
-                targetPx = Instrument.MasterInstrument.RoundToTickSize(px + _side * AtrTargetMult * atr);
-            }
-            else
-            {
-                // ATR not formed yet (fresh chart) — structural fallback, disclosed
-                stopPx = _side > 0 ? _l : _h;
-                double rPts = Math.Abs(px - stopPx);
-                targetPx = Instrument.MasterInstrument.RoundToTickSize(px + _side * rPts);
-                Print($"{Name}: ATR not ready — structural fallback stop at the opposite extreme.");
-            }
-            if (Math.Abs(px - stopPx) < TickSize)
-            {
-                _phase = Phase.Done;                 // entry would sit on the stop
-                return;
-            }
-            string sig = _side > 0 ? SigLong : SigShort;
-
-            SetStopLoss(sig, CalculationMode.Price, stopPx, false);
-            SetProfitTarget(sig, CalculationMode.Price, targetPx);
-            _stopPx = stopPx;
-            _targetPx = targetPx;
+            // Brackets are priced off the ACTUAL average fill and submitted in
+            // OnExecutionUpdate (live-until-cancelled Exit orders, hand-draggable).
+            _stopPx = 0; _targetPx = 0;
             _beApplied = false;
 
             _entryPending = true;                    // BEFORE Enter* — order-event race
@@ -401,8 +484,51 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
         }
 
-        // Breakeven: one-shot stop raise once price covers BreakevenPercent% of the
-        // entry->target run. Uses the ACTUAL average fill as entry.
+        // Live-until-cancelled Exit brackets, submitted/resized on each entry
+        // execution. The strategy never re-asserts them afterwards, so a stop or
+        // target dragged by hand in Chart Trader STAYS where you put it (v3).
+        private void SubmitBrackets(Order entry)
+        {
+            int qty = entry.Filled;
+            if (qty <= 0 || _side == 0)
+                return;
+            if (_stopPx == 0)                        // first fill prices the bracket
+            {
+                double basePx = Position.AveragePrice > 0 ? Position.AveragePrice : entry.AverageFillPrice;
+                double atr = _atrNow;
+                if (atr > TickSize)
+                {
+                    _stopPx = Instrument.MasterInstrument.RoundToTickSize(basePx - _side * AtrStopMult * atr);
+                    _targetPx = Instrument.MasterInstrument.RoundToTickSize(basePx + _side * AtrTargetMult * atr);
+                }
+                else
+                {
+                    // ATR not formed yet (fresh chart) — structural fallback, disclosed
+                    _stopPx = _side > 0 ? _l : _h;
+                    _targetPx = Instrument.MasterInstrument.RoundToTickSize(basePx + _side * Math.Abs(basePx - _stopPx));
+                    Print($"{Name}: ATR not ready — structural fallback stop at the opposite extreme.");
+                }
+                // Rounding can land a level on the fill price — push it one tick out
+                if (Math.Abs(basePx - _stopPx) < TickSize)
+                    _stopPx = Instrument.MasterInstrument.RoundToTickSize(basePx - _side * TickSize);
+                if (Math.Abs(_targetPx - basePx) < TickSize)
+                    _targetPx = Instrument.MasterInstrument.RoundToTickSize(basePx + _side * TickSize);
+            }
+            if (_side > 0)
+            {
+                ExitLongStopMarket(0, true, qty, _stopPx, SigStop, SigLong);
+                ExitLongLimit(0, true, qty, _targetPx, SigTarget, SigLong);
+            }
+            else
+            {
+                ExitShortStopMarket(0, true, qty, _stopPx, SigStop, SigShort);
+                ExitShortLimit(0, true, qty, _targetPx, SigTarget, SigShort);
+            }
+        }
+
+        // Breakeven: one-shot stop move once price covers BreakevenPercent% of the
+        // entry->target run. When enabled it overrides a hand-dragged stop ONCE at
+        // trigger time (guards use the live order prices, synced in OnOrderUpdate).
         private void ManagePosition(double px)
         {
             if (!UseBreakeven || _beApplied || Position.MarketPosition == MarketPosition.Flat)
@@ -421,8 +547,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_side > 0 ? (bePx <= _stopPx || bePx >= _targetPx)
                           : (bePx >= _stopPx || bePx <= _targetPx))
                 return;
-            string sig = _side > 0 ? SigLong : SigShort;
-            SetStopLoss(sig, CalculationMode.Price, bePx, false);
+            if (_side > 0)
+                ExitLongStopMarket(0, true, Position.Quantity, bePx, SigStop, SigLong);
+            else
+                ExitShortStopMarket(0, true, Position.Quantity, bePx, SigStop, SigShort);
             _stopPx = bePx;
             _beApplied = true;
             Print($"{Name}: breakeven armed at {bePx} ({BreakevenPercent}% of run covered).");
@@ -462,7 +590,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_dailyLockout)
             {
                 // A single Exit call isn't guaranteed to fill — retry until flat.
-                if (Position.MarketPosition != MarketPosition.Flat && !_entryPending && !_flattenPending && !_timeExitSent)
+                if (Position.MarketPosition != MarketPosition.Flat && !_entryPending && !_flattenPending)
                     FlattenNow("LB_Flatten");
                 return;
             }
@@ -507,10 +635,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void Lockout(string reason)
         {
             _dailyLockout = true;
-            _phase = Phase.Done;                     // no re-arm until next session
             Print($"{Name}: {reason} — locked out until next session.");
-            if (Position.MarketPosition != MarketPosition.Flat && !_entryPending && !_flattenPending && !_timeExitSent)
+            if (Position.MarketPosition != MarketPosition.Flat && !_entryPending && !_flattenPending)
                 FlattenNow("LB_Flatten");
+            // Mid-hunt (candle/armed/active): abandon the window. In a position or
+            // pending, the flat bookkeeping in OnExecutionUpdate finishes the job.
+            if (_phase == Phase.Candle || _phase == Phase.Armed || _phase == Phase.Active)
+                _phase = Phase.Idle;
         }
 
         private void FlattenNow(string signalName)
@@ -525,22 +656,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ExitShort(signalName, "");
             else
                 _flattenPending = false;
-        }
-
-        private void CheckTimeStop(DateTime t)
-        {
-            // _flattenPending: the governor's flatten and this time stop must never
-            // both be in flight — two market exits would reverse the position naked.
-            if (_timeExitSent || _flattenPending || _t0 == DateTime.MinValue || Position.MarketPosition == MarketPosition.Flat)
-                return;
-            if ((t - _t0).TotalSeconds < TimeStopSeconds)
-                return;
-            _timeExitSent = true;
-            // Position.Quantity, not Contracts — a partial fill must not over-exit
-            if (Position.MarketPosition == MarketPosition.Long)
-                ExitLong(0, Position.Quantity, "LB_TimeExit", SigLong);
-            else
-                ExitShort(0, Position.Quantity, "LB_TimeExit", SigShort);
         }
 
         protected override void OnExecutionUpdate(Execution execution, string executionId,
@@ -560,25 +675,41 @@ namespace NinjaTrader.NinjaScript.Strategies
                         && execution.Order.Filled > 0))
                 {
                     _entryPending = false;           // name-gated clear
-                    if (_phase == Phase.Pending)     // lockout may already have forced Done
+                    if (_phase == Phase.Pending)     // lockout may already have forced flatten
                         _phase = Phase.InPosition;
+                    if (_dailyLockout)
+                    {
+                        // Breach hit while this entry was in flight: close it on
+                        // the fill event itself, no brackets, no extra tick open.
+                        if (!_flattenPending)
+                            FlattenNow("LB_Flatten");
+                        return;
+                    }
+                    SubmitBrackets(execution.Order); // price on first fill, resize on later ones
                 }
                 return;
             }
 
-            bool isExit = n == "Stop loss" || n == "Profit target" || n == "LB_TimeExit"
-                          || n == "LB_Flatten" || n == "Exit on session close";
-            if (isExit && Position.MarketPosition == MarketPosition.Flat)
+            bool isExit = n == SigStop || n == SigTarget || n == "LB_Flatten"
+                          || n == "Exit on session close";
+            // Phase gate: a stale exit event (e.g. interleaved around a Playback
+            // rewind) must not consume a window of the freshly reset day.
+            if (isExit && Position.MarketPosition == MarketPosition.Flat
+                && (_phase == Phase.InPosition || _phase == Phase.Pending))
             {
                 _trades++;
-                _timeExitSent = false;
                 _flattenPending = false;
-                if (_dailyLockout || _trades >= MaxTradesPerSession
-                    || (time - _t0).TotalSeconds > EntryDeadlineSeconds)
-                    _phase = Phase.Done;
+                _stopPx = 0; _targetPx = 0;
+                _beApplied = false;
+                _freeSince = time;                   // gates arming of any window already open
+                double wsecs = _w0 == DateTime.MinValue ? double.MaxValue : (time - _w0).TotalSeconds;
+                if (_dailyLockout || _trades >= MaxTradesPerWindow || wsecs > _wDeadlineSecs)
+                {
+                    ConsumeWindow("trade closed");   // next window (if any) arms when its time comes
+                }
                 else
                 {
-                    _phase = Phase.Armed;            // re-arm for the next break
+                    _phase = Phase.Armed;            // re-arm for the next break in this window
                     _side = 0;
                     _insidePrev = false;             // refreshed on the next tick
                 }
@@ -597,6 +728,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _flattenPending = false;             // governor retries next tick
                 return;
             }
+
+            // Bracket orders: adopt the LIVE price so a hand-dragged stop/target
+            // keeps the breakeven guards honest; warn if one is cancelled by hand.
+            if (order.Name == SigStop || order.Name == SigTarget)
+            {
+                if (orderState == OrderState.Working || orderState == OrderState.Accepted)
+                {
+                    double p = order.Name == SigStop ? stopPrice : limitPrice;
+                    double tracked = order.Name == SigStop ? _stopPx : _targetPx;
+                    if (p > 0 && Math.Abs(p - tracked) >= TickSize * 0.5)
+                    {
+                        Print($"{Name}: {order.Name} moved by hand to {p} — adopted.");
+                        if (order.Name == SigStop) _stopPx = p; else _targetPx = p;
+                    }
+                }
+                else if (orderState == OrderState.Cancelled
+                         && Position.MarketPosition != MarketPosition.Flat
+                         && !_flattenPending && !_dailyLockout)
+                {
+                    Print($"{Name}: {order.Name} cancelled by hand — position no longer protected on that side.");
+                }
+                return;
+            }
+
             if (order.Name != SigLong && order.Name != SigShort)
                 return;
             if (!_entryPending
@@ -605,10 +760,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             _entryPending = false;
             if (filled == 0)
             {
-                // Entry died without a fill -> stand down for the session
+                // Entry died without a fill -> stand down for this window
+                _freeSince = time;
                 if (_phase == Phase.Pending)
-                    _phase = Phase.Done;
-                Print($"{Name}: entry {order.Name} {orderState} unfilled — session stood down.");
+                    ConsumeWindow("entry " + orderState + " unfilled");
+                Print($"{Name}: entry {order.Name} {orderState} unfilled — window stood down.");
             }
             else
             {
@@ -665,83 +821,87 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         #region Properties
         [NinjaScriptProperty]
-        [Display(Name = "Use whipsaw filter", Description = "OFF = naive chase at the break print (research: -$110/trade avg). ON = hold+extension confirmation with re-entry veto.", GroupName = "01. Signal", Order = 0)]
+        [Display(Name = "Trade 18:00 ET (Globex reopen)", Description = "Hunt the opening-candle breakout at the 18:00 ET session begin.", GroupName = "01. Sessions", Order = 0)]
+        public bool TradeGlobexReopen { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trade 20:00 ET (evening)", Description = "Hunt the opening-candle breakout at 20:00 ET (session begin + 2h).", GroupName = "01. Sessions", Order = 1)]
+        public bool TradeEvening { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trade 09:30 ET (US open)", Description = "Hunt the opening-candle breakout at the 09:30 ET US equity open (session begin + 15h30m).", GroupName = "01. Sessions", Order = 2)]
+        public bool TradeUsOpen { get; set; }
+
+        [NinjaScriptProperty, Range(1, 480)]
+        [Display(Name = "Entry window (minutes)", Description = "Hunt breaks/entries only this long after each window opens. An OPEN position is never closed by this clock — it runs to stop/target. A window that opens while a position is still on is skipped.", GroupName = "01. Sessions", Order = 3)]
+        public int EntryWindowMinutes { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Use whipsaw filter", Description = "OFF = naive chase at the break print (research: -$110/trade avg). ON = hold+extension confirmation with re-entry veto.", GroupName = "02. Signal", Order = 0)]
         public bool UseWhipsawFilter { get; set; }
 
         [NinjaScriptProperty, Range(0, 300)]
-        [Display(Name = "Hold seconds", Description = "Seconds the break must survive outside the range before entry. Best Phase-1 cell: 30.", GroupName = "01. Signal", Order = 1)]
+        [Display(Name = "Hold seconds", Description = "Seconds the break must survive outside the range before entry. Best Phase-1 cell: 30.", GroupName = "02. Signal", Order = 1)]
         public int HoldSeconds { get; set; }
 
         [NinjaScriptProperty, Range(0, 3)]
-        [Display(Name = "Extension (xR30)", Description = "Required max excursion beyond the level, as a fraction of the opening candle range. Best Phase-1 cell: 0.25.", GroupName = "01. Signal", Order = 2)]
+        [Display(Name = "Extension (xR30)", Description = "Required max excursion beyond the level, as a fraction of the opening candle range. Best Phase-1 cell: 0.25.", GroupName = "02. Signal", Order = 2)]
         public double ExtensionR30 { get; set; }
 
         [NinjaScriptProperty, Range(5, 300)]
-        [Display(Name = "Candle seconds", GroupName = "01. Signal", Order = 3)]
+        [Display(Name = "Candle seconds", GroupName = "02. Signal", Order = 3)]
         public int CandleSeconds { get; set; }
 
-        [NinjaScriptProperty, Range(60, 3600)]
-        [Display(Name = "Watch end (s from open)", Description = "No NEW breaks after this many seconds from session begin (research: 930 = 18:15:30).", GroupName = "01. Signal", Order = 4)]
-        public int WatchEndSeconds { get; set; }
-
-        [NinjaScriptProperty, Range(60, 3600)]
-        [Display(Name = "Entry deadline (s from open)", Description = "No entries after this (research: 1200 = 18:20).", GroupName = "01. Signal", Order = 5)]
-        public int EntryDeadlineSeconds { get; set; }
-
         [NinjaScriptProperty, Range(0, 100)]
-        [Display(Name = "Min R30 ticks", Description = "Skip the session if the opening candle range is smaller (degenerate).", GroupName = "01. Signal", Order = 6)]
+        [Display(Name = "Min R30 ticks", Description = "Skip the window if the opening candle range is smaller (degenerate).", GroupName = "02. Signal", Order = 4)]
         public int MinR30Ticks { get; set; }
 
         [NinjaScriptProperty, Range(1, 100)]
-        [Display(Name = "Contracts", GroupName = "02. Trade", Order = 0)]
+        [Display(Name = "Contracts", GroupName = "03. Trade", Order = 0)]
         public int Contracts { get; set; }
 
         [NinjaScriptProperty, Range(2, 100)]
-        [Display(Name = "ATR period", Description = "Wilder ATR on the PRIMARY chart series — the chart timeframe defines what the ATR measures.", GroupName = "02. Trade", Order = 1)]
+        [Display(Name = "ATR period", Description = "Wilder ATR on the PRIMARY chart series — the chart timeframe defines what the ATR measures.", GroupName = "03. Trade", Order = 1)]
         public int AtrPeriod { get; set; }
 
         [NinjaScriptProperty, Range(0.25, 10)]
-        [Display(Name = "Stop (x ATR)", Description = "Stop = entry -/+ this many ATRs.", GroupName = "02. Trade", Order = 2)]
+        [Display(Name = "Stop (x ATR)", Description = "Initial stop = fill -/+ this many ATRs. Hand-draggable once working.", GroupName = "03. Trade", Order = 2)]
         public double AtrStopMult { get; set; }
 
         [NinjaScriptProperty, Range(0.25, 10)]
-        [Display(Name = "Target (x ATR)", Description = "Target = entry +/- this many ATRs.", GroupName = "02. Trade", Order = 3)]
+        [Display(Name = "Target (x ATR)", Description = "Initial target = fill +/- this many ATRs. Hand-draggable once working.", GroupName = "03. Trade", Order = 3)]
         public double AtrTargetMult { get; set; }
 
         [NinjaScriptProperty, Range(1, 10)]
-        [Display(Name = "Max trades per session", GroupName = "02. Trade", Order = 4)]
-        public int MaxTradesPerSession { get; set; }
-
-        [NinjaScriptProperty, Range(300, 7200)]
-        [Display(Name = "Time stop (s from open)", Description = "Flatten if still in a position this many seconds after session begin (research: 1800 = 18:30).", GroupName = "02. Trade", Order = 5)]
-        public int TimeStopSeconds { get; set; }
+        [Display(Name = "Max trades per window", GroupName = "03. Trade", Order = 4)]
+        public int MaxTradesPerWindow { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Use breakeven", Description = "Move the stop to entry (+offset) once price covers a % of the entry->target run.", GroupName = "03. Breakeven", Order = 0)]
+        [Display(Name = "Use breakeven", Description = "Move the stop to entry (+offset) once price covers a % of the entry->target run. When it triggers it overrides a hand-dragged stop ONCE.", GroupName = "04. Breakeven", Order = 0)]
         public bool UseBreakeven { get; set; }
 
         [NinjaScriptProperty, Range(1, 99)]
-        [Display(Name = "Breakeven trigger (% of run)", Description = "Percent of the entry->target distance that must be covered before the stop moves to breakeven.", GroupName = "03. Breakeven", Order = 1)]
+        [Display(Name = "Breakeven trigger (% of run)", Description = "Percent of the entry->target distance that must be covered before the stop moves to breakeven.", GroupName = "04. Breakeven", Order = 1)]
         public int BreakevenPercent { get; set; }
 
         [NinjaScriptProperty, Range(-20, 20)]
-        [Display(Name = "Breakeven offset (ticks)", Description = "Breakeven stop = entry +/- this many ticks (positive covers commissions).", GroupName = "03. Breakeven", Order = 2)]
+        [Display(Name = "Breakeven offset (ticks)", Description = "Breakeven stop = entry +/- this many ticks (positive covers commissions).", GroupName = "04. Breakeven", Order = 2)]
         public int BreakevenOffsetTicks { get; set; }
 
         [NinjaScriptProperty, Range(0, 100000)]
-        [Display(Name = "Daily profit target (USD)", Description = "Real-time (realized + unrealized). On hit: flatten + no more entries until next session. 0 = off.", GroupName = "04. Daily limits", Order = 0)]
+        [Display(Name = "Daily profit target (USD)", Description = "Real-time (realized + unrealized). On hit: flatten + no more entries until next session. 0 = off.", GroupName = "05. Daily limits", Order = 0)]
         public double DailyProfitTargetUSD { get; set; }
 
         [NinjaScriptProperty, Range(0, 100000)]
-        [Display(Name = "Daily loss limit (USD)", Description = "Real-time (realized + unrealized). On hit: flatten + no more entries until next session. 0 = off.", GroupName = "04. Daily limits", Order = 1)]
+        [Display(Name = "Daily loss limit (USD)", Description = "Real-time (realized + unrealized). On hit: flatten + no more entries until next session. 0 = off.", GroupName = "05. Daily limits", Order = 1)]
         public double DailyLossLimitUSD { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Account-wide (all markets)", Description = "Watch the ACCOUNT's combined day PnL: every instance of this strategy on the account flattens together on a breach (BigPrints shared governor). OFF = this instance's own PnL only.", GroupName = "04. Daily limits", Order = 2)]
+        [Display(Name = "Account-wide (all markets)", Description = "Watch the ACCOUNT's combined day PnL: every instance of this strategy on the account flattens together on a breach (BigPrints shared governor). OFF = this instance's own PnL only.", GroupName = "05. Daily limits", Order = 2)]
         public bool UseAccountDailyPnL { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Show drawings", GroupName = "05. Visuals", Order = 0)]
+        [Display(Name = "Show drawings", GroupName = "06. Visuals", Order = 0)]
         public bool ShowDrawings { get; set; }
         #endregion
     }
