@@ -160,6 +160,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool _confirmLogged;                 // one confirm record per episode
         private string _entryVia = "v3";             // confirm | trigger | v3
         private bool _noTapeWarned;
+        private bool _expectTargetCancel;            // one-shot: BE's OCO cancel-replace of the target
 
         // Forward outcome tracker: multi-slot (the BigPrints single-slot lesson),
         // MFE/MAE checkpoints at 30/60/120 s, closed at 600 s or on session reset.
@@ -220,6 +221,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SupportMinVolume = 50;              // reopen-tape scale (Javier's cases: 50-93c) — NOT BigPrints' RTH 150
                 SupportWindowSec = 120;
                 ClusterMilliseconds = 150;
+                SupportMinMaxPrint = 0;             // 0 = sweep-total semantics; >0 = require one strong print
 
                 ShowDrawings = true;
             }
@@ -269,6 +271,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             _flattenPending = false;
             _targetPx = 0; _stopPx = 0;
             _beApplied = false;
+            _expectTargetCancel = false;
             _dailyLockout = false;
             _dayStartRealized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
 
@@ -617,9 +620,36 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (FlowActive())
             {
                 FlowLogEntry(t, px);
+                FlowAnnounceSupport(t);              // Output + gold dot: WHY this entry was licensed
                 if (_entryVia == "trigger")          // no confirm record exists for this episode
                     FlowOpenTrack($"e{_tag}_{t.Ticks}", t, _side, px);
             }
+        }
+
+        // Show what licensed the entry. Without this the gate's reasons are
+        // invisible: the BigPrints indicator is usually NOT on this chart, and a
+        // supporting "cluster" is a sweep SUM of small prints — nothing a 30 s
+        // chart shows. Gold dot = the freshest same-side supporting sweep.
+        private void FlowAnnounceSupport(DateTime t)
+        {
+            long sv, ov; int sn;
+            FlowSupported(_side, t, out sv, out ov, out sn);
+            FlowCluster latest = null;
+            lock (_flowLock)
+            {
+                foreach (FlowCluster c in _flowClusters)
+                    if (c.Epoch == _flowEpoch && c.IsBuy == (_side > 0) && c.Time <= t
+                        && c.MaxPrint >= SupportMinMaxPrint
+                        && (latest == null || c.Time > latest.Time))
+                        latest = c;
+            }
+            string detail = latest == null ? "" : string.Format(
+                CultureInfo.InvariantCulture,
+                " — last sweep {0}c (max print {1}c @ {2})",
+                latest.Volume, latest.MaxPrint, latest.Price);
+            Print($"{Name}: entry via {_entryVia} — support {sv}c in {sn} sweep(s) vs {ov}c opposite{detail}.");
+            if (ShowDrawings && ChartControl != null && latest != null)
+                Draw.Dot(this, Tag($"LB_S_{_tag}_{latest.Time.Ticks}"), false, latest.Time, latest.Price, Brushes.Gold);
         }
 
         // Live-until-cancelled Exit brackets, submitted/resized on each entry
@@ -685,12 +715,27 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_side > 0 ? (bePx <= _stopPx || bePx >= _targetPx)
                           : (bePx >= _stopPx || bePx <= _targetPx))
                 return;
-            if (_side > 0)
-                ExitLongStopMarket(0, true, Position.Quantity, bePx, SigStop, SigLong);
-            else
-                ExitShortStopMarket(0, true, Position.Quantity, bePx, SigStop, SigShort);
+            // Trackers BEFORE the submits: Playback can invoke OnOrderUpdate
+            // synchronously in-stack, and a stale tracker made the BE's own echo
+            // print as "moved by hand" (observed 2026-08-02). The stop change is
+            // also a cancel-replace under OCO, which killed the TARGET leg —
+            // re-submit it in the same breath (one-shot expected-cancel flag
+            // keeps the by-hand warning honest).
             _stopPx = bePx;
             _beApplied = true;
+            _expectTargetCancel = _targetPx > 0;
+            if (_side > 0)
+            {
+                ExitLongStopMarket(0, true, Position.Quantity, bePx, SigStop, SigLong);
+                if (_targetPx > 0)
+                    ExitLongLimit(0, true, Position.Quantity, _targetPx, SigTarget, SigLong);
+            }
+            else
+            {
+                ExitShortStopMarket(0, true, Position.Quantity, bePx, SigStop, SigShort);
+                if (_targetPx > 0)
+                    ExitShortLimit(0, true, Position.Quantity, _targetPx, SigTarget, SigShort);
+            }
             Print($"{Name}: breakeven armed at {bePx} ({BreakevenPercent}% of run covered).");
         }
 
@@ -839,6 +884,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _flattenPending = false;
                 _stopPx = 0; _targetPx = 0;
                 _beApplied = false;
+                _expectTargetCancel = false;
                 _freeSince = time;                   // gates arming of any window already open
                 if (FlowActive())
                     FlowLogTradeClose(time, n);
@@ -888,7 +934,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                          && Position.MarketPosition != MarketPosition.Flat
                          && !_flattenPending && !_dailyLockout)
                 {
-                    Print($"{Name}: {order.Name} cancelled by hand — position no longer protected on that side.");
+                    if (order.Name == SigTarget && _expectTargetCancel)
+                    {
+                        _expectTargetCancel = false; // BE's OCO cancel-replace — target re-submitted, not hand-cancelled
+                    }
+                    else
+                    {
+                        if (order.Name == SigTarget)
+                            _targetPx = 0;           // respect the hand-cancel: BE must not resurrect it
+                        Print($"{Name}: {order.Name} cancelled by hand — position no longer protected on that side.");
+                    }
                 }
                 return;
             }
@@ -1071,6 +1126,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (c.Epoch != _flowEpoch || c.Time < cutoff || c.Time > t)
                         continue;                    // stale epoch, out of window, or a future-stamped ghost
+                    if (c.MaxPrint < SupportMinMaxPrint)
+                        continue;                    // "one strong print" requirement (0 = off)
                     if (c.IsBuy == (side > 0)) { sameVol += c.Volume; sameCount++; }
                     else oppVol += c.Volume;
                 }
@@ -1089,6 +1146,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 foreach (FlowCluster c in _flowClusters)
                     if (c.Epoch == _flowEpoch && c.IsBuy == (_side > 0)
+                        && c.MaxPrint >= SupportMinMaxPrint
                         && c.Time >= _tBreak && c.Time <= t)
                         return true;
             }
@@ -1135,7 +1193,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             return "\"t\":\"" + JT(t) + "\",\"instrument\":\"" + Instrument.MasterInstrument.Name
                 + "\",\"window\":\"" + WinNames[Math.Min(_nextWin, WinNames.Length - 1)]
                 + "\",\"side\":" + _side + ",\"r30\":" + _r30 + ",\"level\":" + J(_level) + ",\"px\":" + J(px)
-                + ",\"mode\":\"" + FlowGate + "\",\"min_vol\":" + SupportMinVolume + ",\"win_sec\":" + SupportWindowSec;
+                + ",\"mode\":\"" + FlowGate + "\",\"min_vol\":" + SupportMinVolume
+                + ",\"min_mp\":" + SupportMinMaxPrint + ",\"win_sec\":" + SupportWindowSec;
         }
 
         private void FlowLogConfirm(DateTime t, double px, bool supported, long sameVol, long oppVol, int sameCount)
@@ -1320,6 +1379,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty, Range(0, 5000)]
         [Display(Name = "Cluster gap (ms)", Description = "Max gap between same-side prints folded into one sweep cluster (BigPrints default 150).", GroupName = "07. Flow gate", Order = 3)]
         public int ClusterMilliseconds { get; set; }
+
+        [NinjaScriptProperty, Range(0, 10000)]
+        [Display(Name = "Support min MAX print (contracts)", Description = "0 = off. A sweep only counts as support if its largest SINGLE print reaches this size — 'one strong entry' semantics instead of many small prints accumulating to the total.", GroupName = "07. Flow gate", Order = 4)]
+        public int SupportMinMaxPrint { get; set; }
         #endregion
     }
 }
