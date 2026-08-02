@@ -16,6 +16,30 @@ Cluster rules: same-side aggressor prints, <=150 ms gap, <=1500 ms span; support
 - TRIGGER 1R (first supported break/session): n=17 | win%=35 | E[$/trade]=-223.91 (t=-1.53) | total=$-3806
 - TRIGGER 2R (first supported break/session): n=17 | win%=35 | E[$/trade]=-176.56 (t=-1.02) | total=$-3002
 
+### threshold 55c — supported 268/2918 breaks (9%)
+- real-rate: supported **1.9%** (5/268) vs unsupported 0.6% (16/2650) | z=+2.33
+- MFE@120s median (ticks): supported 26 vs unsupported 25
+- TRIGGER 1R (first supported break/session): n=14 | win%=36 | E[$/trade]=-164.50 (t=-1.07) | total=$-2303
+- TRIGGER 2R (first supported break/session): n=14 | win%=36 | E[$/trade]=-107.00 (t=-0.57) | total=$-1498
+
+### threshold 60c — supported 214/2918 breaks (7%)
+- real-rate: supported **2.3%** (5/214) vs unsupported 0.6% (16/2704) | z=+2.91
+- MFE@120s median (ticks): supported 26 vs unsupported 25
+- TRIGGER 1R (first supported break/session): n=12 | win%=42 | E[$/trade]=-131.58 (t=-0.74) | total=$-1579
+- TRIGGER 2R (first supported break/session): n=12 | win%=42 | E[$/trade]=-64.50 (t=-0.30) | total=$-774
+
+### threshold 65c — supported 181/2918 breaks (6%)
+- real-rate: supported **2.2%** (4/181) vs unsupported 0.6% (17/2737) | z=+2.45
+- MFE@120s median (ticks): supported 26 vs unsupported 25
+- TRIGGER 1R (first supported break/session): n=11 | win%=45 | E[$/trade]=-104.50 (t=-0.55) | total=$-1150
+- TRIGGER 2R (first supported break/session): n=11 | win%=45 | E[$/trade]=-31.32 (t=-0.13) | total=$-344
+
+### threshold 70c — supported 179/2918 breaks (6%)
+- real-rate: supported **2.2%** (4/179) vs unsupported 0.6% (17/2739) | z=+2.48
+- MFE@120s median (ticks): supported 26 vs unsupported 25
+- TRIGGER 1R (first supported break/session): n=10 | win%=50 | E[$/trade]=-26.50 (t=-0.14) | total=$-265
+- TRIGGER 2R (first supported break/session): n=10 | win%=50 | E[$/trade]=+54.00 (t=0.22) | total=$+540
+
 ### threshold 80c — supported 146/2918 breaks (5%)
 - real-rate: supported **2.1%** (3/146) vs unsupported 0.6% (18/2772) | z=+1.96
 - MFE@120s median (ticks): supported 23 vs unsupported 25
@@ -77,6 +101,30 @@ Cluster rules: same-side aggressor prints, <=150 ms gap, <=1500 ms span; support
 - MFE@120s median (ticks): supported 44 vs unsupported 30
 - TRIGGER 1R (first supported break/session): n=25 | win%=32 | E[$/trade]=-17.62 (t=-1.27) | total=$-440
 - TRIGGER 2R (first supported break/session): n=25 | win%=32 | E[$/trade]=-17.54 (t=-1.22) | total=$-438
+
+### threshold 55c — supported 733/2186 breaks (34%)
+- real-rate: supported **0.3%** (2/733) vs unsupported 0.2% (3/1453) | z=+0.31
+- MFE@120s median (ticks): supported 44 vs unsupported 29
+- TRIGGER 1R (first supported break/session): n=24 | win%=33 | E[$/trade]=-20.40 (t=-1.46) | total=$-490
+- TRIGGER 2R (first supported break/session): n=24 | win%=33 | E[$/trade]=-17.23 (t=-1.14) | total=$-414
+
+### threshold 60c — supported 674/2186 breaks (31%)
+- real-rate: supported **0.3%** (2/674) vs unsupported 0.2% (3/1512) | z=+0.44
+- MFE@120s median (ticks): supported 41 vs unsupported 30
+- TRIGGER 1R (first supported break/session): n=22 | win%=32 | E[$/trade]=-24.00 (t=-1.60) | total=$-528
+- TRIGGER 2R (first supported break/session): n=22 | win%=32 | E[$/trade]=-22.55 (t=-1.43) | total=$-496
+
+### threshold 65c — supported 624/2186 breaks (29%)
+- real-rate: supported **0.3%** (2/624) vs unsupported 0.2% (3/1562) | z=+0.57
+- MFE@120s median (ticks): supported 45 vs unsupported 30
+- TRIGGER 1R (first supported break/session): n=19 | win%=32 | E[$/trade]=-20.87 (t=-1.28) | total=$-396
+- TRIGGER 2R (first supported break/session): n=19 | win%=32 | E[$/trade]=-17.82 (t=-1.02) | total=$-338
+
+### threshold 70c — supported 551/2186 breaks (25%)
+- real-rate: supported **0.4%** (2/551) vs unsupported 0.2% (3/1635) | z=+0.76
+- MFE@120s median (ticks): supported 47 vs unsupported 29
+- TRIGGER 1R (first supported break/session): n=17 | win%=29 | E[$/trade]=-23.56 (t=-1.33) | total=$-400
+- TRIGGER 2R (first supported break/session): n=17 | win%=29 | E[$/trade]=-19.68 (t=-1.03) | total=$-334
 
 ### threshold 80c — supported 438/2186 breaks (20%)
 - real-rate: supported **0.5%** (2/438) vs unsupported 0.2% (3/1748) | z=+1.12

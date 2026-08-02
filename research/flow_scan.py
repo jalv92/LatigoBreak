@@ -27,7 +27,7 @@ DOCS = Path(__file__).parent.parent / "docs" / "research"
 GAP_MS = 150
 SPAN_MS = 1500
 NET_MS = corpus.NET_S // 1000
-THRESHOLDS = (30, 50, 80, 120)
+THRESHOLDS = (30, 50, 55, 60, 65, 70, 80, 120)
 SUPPORT_WINDOW_S = 120           # pre-break lookback, mirrors SupportWindowSec
 TRIGGER_GRACE_S = 5              # cluster firing this soon after the break = Trigger entry
 
