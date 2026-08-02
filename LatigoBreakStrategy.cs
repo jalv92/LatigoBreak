@@ -38,6 +38,8 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.Globalization;
+using System.IO;
 using System.Windows.Media;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
@@ -50,6 +52,12 @@ using NinjaTrader.NinjaScript.DrawingTools;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
+    // v4 flow gate: Off = module dormant; LogOnly = log the support verdict on
+    // every confirmed break, trade pure v3; Filter = enter only breaks with
+    // big-print support; Trigger = Filter + a fresh supporting cluster fires
+    // the entry immediately (no hold wait).
+    public enum LatigoFlowGateMode { Off = 0, LogOnly = 1, Filter = 2, Trigger = 3 }
+
     public class LatigoBreakStrategy : Strategy
     {
         private enum Phase { Idle, Candle, Armed, Active, Pending, InPosition }
@@ -120,6 +128,56 @@ namespace NinjaTrader.NinjaScript.Strategies
         private static readonly Dictionary<string, AcctDayGov> _acctGov = new Dictionary<string, AcctDayGov>();
         private DateTime _acctSessionDay = DateTime.MinValue;
 
+        // --- v4 flow gate: big-print support detection (BigPrints tape port) ---
+        // OnMarketData (market-data thread) classifies aggressor prints and folds
+        // them into sweep clusters; fired clusters land in _flowClusters under
+        // _flowLock. The strategy thread ONLY reads the list — orders are never
+        // touched from the market-data thread (BigPrints crash-dump rule).
+        private const int FlowClusterSpanMs = 1500;  // hard wall on one sweep's duration
+        private double _fBid, _fAsk;                 // market-data thread only
+        private bool _fClusterOpen, _fClusterIsBuy;
+        private long _fClusterVolume, _fClusterMaxPrint;
+        private double _fClusterPrice;               // price of the largest print
+        private DateTime _fClusterStart = DateTime.MinValue, _fClusterLast = DateTime.MinValue;
+        private volatile bool _flowResetRequested;   // rewind fence — drained inside OnMarketData
+        private volatile int _flowEpoch;             // bumped on every reset; stale in-flight clusters stamp the old value
+        private int _fEpoch;                         // market-data thread's snapshot, taken at each OnMarketData entry
+        private int _flowClustersEverFired;          // diagnostic only, tearing tolerated
+
+        private sealed class FlowCluster
+        {
+            public DateTime Time;
+            public bool IsBuy;
+            public long Volume;
+            public long MaxPrint;
+            public double Price;
+            public int Epoch;
+        }
+        private readonly object _flowLock = new object();
+        private readonly List<FlowCluster> _flowClusters = new List<FlowCluster>();
+
+        // Per-break-episode bookkeeping (strategy thread)
+        private bool _confirmLogged;                 // one confirm record per episode
+        private string _entryVia = "v3";             // confirm | trigger | v3
+        private bool _noTapeWarned;
+
+        // Forward outcome tracker: multi-slot (the BigPrints single-slot lesson),
+        // MFE/MAE checkpoints at 30/60/120 s, closed at 600 s or on session reset.
+        private sealed class FlowTrack
+        {
+            public string Id;
+            public DateTime T0;
+            public int Side;
+            public double Px0;
+            public double MaxFav, MinFav;            // signed points from Px0
+            public bool C30, C60, C120;
+            public double Fav30, Adv30, Fav60, Adv60, Fav120, Adv120;
+        }
+        private readonly List<FlowTrack> _flowTracks = new List<FlowTrack>();
+
+        private static readonly object _flowLogLock = new object();
+        private string _flowLogPath;
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
@@ -158,6 +216,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DailyLossLimitUSD = 300;
                 UseAccountDailyPnL = false;         // multi-market shared close OFF by default
 
+                FlowGate = LatigoFlowGateMode.Filter;
+                SupportMinVolume = 50;              // reopen-tape scale (Javier's cases: 50-93c) — NOT BigPrints' RTH 150
+                SupportWindowSec = 120;
+                ClusterMilliseconds = 150;
+
                 ShowDrawings = true;
             }
             else if (State == State.Configure)
@@ -172,6 +235,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (Account != null)
                     lock (_acctGovLock) _acctGov.Remove(Account.Name);
                 ResetSession(false);
+            }
+            else if (State == State.Realtime)
+            {
+                if (FlowGate != LatigoFlowGateMode.Off)
+                    Print($"{Name}: flow gate {FlowGate} ACTIVE (min {SupportMinVolume}c, window {SupportWindowSec}s). Needs live L1 tape — historical bars / Strategy Analyzer trade as pure v3.");
             }
         }
 
@@ -203,6 +271,22 @@ namespace NinjaTrader.NinjaScript.Strategies
             _beApplied = false;
             _dailyLockout = false;
             _dayStartRealized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+
+            // Flow gate: flush open forward-tracks as truncated, drop fired
+            // clusters, and (on rewind) fence the market-data thread's builder.
+            // The epoch bump makes the fence airtight: an in-flight OnMarketData
+            // call that started before this reset stamps its cluster with the
+            // OLD epoch, and the support verdict ignores it.
+            FlowFlushTracks("reset");
+            lock (_flowLock)
+            {
+                _flowEpoch++;
+                _flowClusters.Clear();
+            }
+            if (removeDrawings)
+                _flowResetRequested = true;          // drained inside OnMarketData
+            _confirmLogged = false;
+            _entryVia = "v3";
         }
 
         private void ResetWindowState()
@@ -263,6 +347,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             CheckRiskGovernor();                     // real-time daily limits — runs in EVERY phase
+            FlowTracksUpdate(t, px);                 // forward MFE/MAE for logged breaks
 
             // An open position is never closed by the clock (v3): it runs to
             // stop/target while later windows pass by unarmed.
@@ -325,9 +410,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (beyondOpp)
                         OpenBreak(t, px, -oldSide);
                 }
-                else if (ConfirmReady(t))
+                else
                 {
-                    SubmitEntry(t, px);
+                    bool confirmed = ConfirmReady(t);
+                    if (confirmed)
+                        FlowNoteConfirm(t, px);
+
+                    // Trigger mode: a fresh supporting cluster since the break
+                    // fires the entry at once — no hold wait, entry at the level.
+                    if (!confirmed && FlowGate == LatigoFlowGateMode.Trigger && FlowActive()
+                        && FlowTriggerReady(t))
+                    {
+                        _entryVia = "trigger";
+                        SubmitEntry(t, px);
+                    }
+                    else if (confirmed && FlowEntryAllowed(t))
+                    {
+                        _entryVia = "confirm";
+                        SubmitEntry(t, px);
+                    }
                 }
             }
 
@@ -444,15 +545,45 @@ namespace NinjaTrader.NinjaScript.Strategies
             _breakPx = px;
             _maxExt = ExtTicks(px);
             _phase = Phase.Active;
+            _confirmLogged = false;                  // new episode, new confirm record
             if (ShowDrawings && ChartControl != null && CurrentBars[0] != _lastDotBar)
             {
                 _lastDotBar = CurrentBars[0];        // one break dot per primary bar
                 Draw.Dot(this, Tag($"LB_B_{_tag}_{_lastDotBar}"), false, t, px,
                          side > 0 ? Brushes.DodgerBlue : Brushes.Magenta);
             }
-            // hold=0 configs (or filter off) can confirm on the break print itself
+            // hold=0 configs (or filter off) can confirm on the break print itself.
+            // FlowNoteConfirm BEFORE the entry decision — this shortcut bypassed
+            // all corpus logging (review 2026-08-02, critical finding).
             if (ConfirmReady(t))
-                SubmitEntry(t, px);
+            {
+                FlowNoteConfirm(t, px);
+                if (FlowEntryAllowed(t))
+                {
+                    _entryVia = "confirm";
+                    SubmitEntry(t, px);
+                }
+            }
+        }
+
+        // One confirm record + forward track per break episode, at the moment
+        // v3 WOULD enter — the scoring anchor for supported vs unsupported.
+        // Called from BOTH the Active-phase loop and OpenBreak's instant-confirm
+        // shortcut (filter off / hold=0), which previously skipped it.
+        private void FlowNoteConfirm(DateTime t, double px)
+        {
+            if (_confirmLogged || !FlowActive())
+                return;
+            _confirmLogged = true;
+            long sv, ov; int sn;
+            bool sup = FlowSupported(_side, t, out sv, out ov, out sn);
+            FlowLogConfirm(t, px, sup, sv, ov, sn);
+            FlowOpenTrack($"c{_tag}_{t.Ticks}", t, _side, px);
+            if (!sup && _flowClustersEverFired == 0 && !_noTapeWarned)
+            {
+                _noTapeWarned = true;
+                Print($"{Name}: flow gate has seen ZERO clusters this session — check that the feed carries L1 bid/ask.");
+            }
         }
 
         private void SubmitEntry(DateTime t, double px)
@@ -481,6 +612,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Draw.TriangleUp(this, Tag($"LB_E_{_tag}_{t.Ticks}"), false, t, px - 8 * TickSize, Brushes.Lime);
                 else
                     Draw.TriangleDown(this, Tag($"LB_E_{_tag}_{t.Ticks}"), false, t, px + 8 * TickSize, Brushes.Red);
+            }
+
+            if (FlowActive())
+            {
+                FlowLogEntry(t, px);
+                if (_entryVia == "trigger")          // no confirm record exists for this episode
+                    FlowOpenTrack($"e{_tag}_{t.Ticks}", t, _side, px);
             }
         }
 
@@ -702,6 +840,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _stopPx = 0; _targetPx = 0;
                 _beApplied = false;
                 _freeSince = time;                   // gates arming of any window already open
+                if (FlowActive())
+                    FlowLogTradeClose(time, n);
+                _entryVia = "v3";
                 double wsecs = _w0 == DateTime.MinValue ? double.MaxValue : (time - _w0).TotalSeconds;
                 if (_dailyLockout || _trades >= MaxTradesPerWindow || wsecs > _wDeadlineSecs)
                 {
@@ -762,6 +903,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 // Entry died without a fill -> stand down for this window
                 _freeSince = time;
+                if (FlowActive())                    // close the orphaned "entry" record in the corpus
+                    FlowLogTradeClose(time, "entry_" + orderState + "_unfilled");
                 if (_phase == Phase.Pending)
                     ConsumeWindow("entry " + orderState + " unfilled");
                 Print($"{Name}: entry {order.Name} {orderState} unfilled — window stood down.");
@@ -817,6 +960,264 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Vendor/Custom duplicate-type CS1503 under nt8c.
             if (ShowDrawings && ChartControl != null)
                 Draw.Text(this, Tag($"LB_N_{_tag}"), msg, 0, y, Brushes.Gray);
+        }
+
+        // --- v4 flow gate ---------------------------------------------------
+
+        // OnMarketData never fires on historical bars, so the gate can only
+        // exist on live/Playback tape — everywhere else FlowActive() is false
+        // and the strategy behaves exactly like v3.
+        private bool FlowActive()
+        {
+            return FlowGate != LatigoFlowGateMode.Off && State == State.Realtime;
+        }
+
+        // Market-data thread: classify aggressor prints (at/above ask = buy,
+        // at/below bid = sell, inside spread = no aggressor) and fold them into
+        // same-side sweep clusters (gap <= ClusterMilliseconds, span <= 1.5 s).
+        // Compute-only — the strategy thread drains the results.
+        protected override void OnMarketData(MarketDataEventArgs e)
+        {
+            if (FlowGate == LatigoFlowGateMode.Off || CurrentBar < 0 || State != State.Realtime)
+                return;
+
+            if (_flowResetRequested)                 // Playback rewind fence (DataLoaded does NOT re-run)
+            {
+                _flowResetRequested = false;
+                _fClusterOpen = false;
+                _fBid = 0; _fAsk = 0;
+            }
+            _fEpoch = _flowEpoch;                    // clusters finalized in THIS call carry this stamp
+
+            DateTime t = e.Time;
+
+            // Tape-clock timeout: ANY later event closes an open cluster at its
+            // real end (lower latency than waiting for the next breaking print).
+            if (_fClusterOpen && (t - _fClusterLast).TotalMilliseconds > ClusterMilliseconds)
+                FlowFinalizeCluster();
+
+            if (e.MarketDataType == MarketDataType.Bid) { _fBid = e.Price; return; }
+            if (e.MarketDataType == MarketDataType.Ask) { _fAsk = e.Price; return; }
+            if (e.MarketDataType != MarketDataType.Last || _fBid <= 0 || _fAsk <= 0)
+                return;
+
+            bool isBuy;
+            if (e.Price >= _fAsk) isBuy = true;
+            else if (e.Price <= _fBid) isBuy = false;
+            else return;                             // inside the spread — no aggressor
+
+            if (_fClusterOpen && isBuy == _fClusterIsBuy
+                && (t - _fClusterLast).TotalMilliseconds <= ClusterMilliseconds
+                && (t - _fClusterStart).TotalMilliseconds <= FlowClusterSpanMs)
+            {
+                _fClusterVolume += e.Volume;
+                if (e.Volume > _fClusterMaxPrint)
+                {
+                    _fClusterMaxPrint = e.Volume;
+                    _fClusterPrice = e.Price;
+                }
+                _fClusterLast = t;
+                return;
+            }
+
+            FlowFinalizeCluster();
+            _fClusterOpen = true;
+            _fClusterIsBuy = isBuy;
+            _fClusterVolume = e.Volume;
+            _fClusterMaxPrint = e.Volume;
+            _fClusterPrice = e.Price;
+            _fClusterStart = t;
+            _fClusterLast = t;
+        }
+
+        private void FlowFinalizeCluster()
+        {
+            if (!_fClusterOpen)
+                return;
+            _fClusterOpen = false;
+            if (_fClusterVolume < SupportMinVolume)
+                return;
+            System.Threading.Interlocked.Increment(ref _flowClustersEverFired);
+            lock (_flowLock)
+            {
+                _flowClusters.Add(new FlowCluster
+                {
+                    Time = _fClusterLast,
+                    IsBuy = _fClusterIsBuy,
+                    Volume = _fClusterVolume,
+                    MaxPrint = _fClusterMaxPrint,
+                    Price = _fClusterPrice,
+                    Epoch = _fEpoch,
+                });
+                DateTime cutoff = _fClusterLast.AddSeconds(-SupportWindowSec);
+                _flowClusters.RemoveAll(c => c.Time < cutoff);
+                if (_flowClusters.Count > 64)        // hard cap — 64 big prints in one window is another regime
+                    _flowClusters.RemoveAt(0);
+            }
+        }
+
+        // Support verdict at decision time: same-side big-print volume inside
+        // the rolling window must reach SupportMinVolume AND outweigh the
+        // opposite side. Strategy thread only.
+        private bool FlowSupported(int side, DateTime t, out long sameVol, out long oppVol, out int sameCount)
+        {
+            sameVol = 0; oppVol = 0; sameCount = 0;
+            if (_flowResetRequested)
+                return false;                        // mid-rewind: never trust the list
+            DateTime cutoff = t.AddSeconds(-SupportWindowSec);
+            lock (_flowLock)
+            {
+                foreach (FlowCluster c in _flowClusters)
+                {
+                    if (c.Epoch != _flowEpoch || c.Time < cutoff || c.Time > t)
+                        continue;                    // stale epoch, out of window, or a future-stamped ghost
+                    if (c.IsBuy == (side > 0)) { sameVol += c.Volume; sameCount++; }
+                    else oppVol += c.Volume;
+                }
+            }
+            return sameVol >= SupportMinVolume && sameVol >= oppVol;
+        }
+
+        // Trigger mode: a supporting cluster fired SINCE this break (and the
+        // window balance agrees) fires the entry with no hold wait.
+        private bool FlowTriggerReady(DateTime t)
+        {
+            long sv, ov; int sn;
+            if (!FlowSupported(_side, t, out sv, out ov, out sn))
+                return false;
+            lock (_flowLock)
+            {
+                foreach (FlowCluster c in _flowClusters)
+                    if (c.Epoch == _flowEpoch && c.IsBuy == (_side > 0)
+                        && c.Time >= _tBreak && c.Time <= t)
+                        return true;
+            }
+            return false;
+        }
+
+        private bool FlowEntryAllowed(DateTime t)
+        {
+            if (!FlowActive() || FlowGate == LatigoFlowGateMode.LogOnly)
+                return true;                         // Off / LogOnly / no live tape -> pure v3
+            long sv, ov; int sn;
+            return FlowSupported(_side, t, out sv, out ov, out sn);
+        }
+
+        // --- v4 corpus log + forward outcome tracks -------------------------
+
+        private static string J(double v)
+        {
+            return v.ToString("0.####", CultureInfo.InvariantCulture);
+        }
+
+        private static string JT(DateTime t)
+        {
+            return t.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture);
+        }
+
+        private void FlowAppend(string json)
+        {
+            try                                      // logging must never break trading
+            {
+                if (_flowLogPath == null)
+                    _flowLogPath = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "BigPrintsAI", "latigo_flow_log.jsonl");
+                lock (_flowLogLock)
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(_flowLogPath));
+                    File.AppendAllText(_flowLogPath, json + Environment.NewLine);
+                }
+            }
+            catch { }
+        }
+
+        private string FlowCommonJson(DateTime t, double px)
+        {
+            return "\"t\":\"" + JT(t) + "\",\"instrument\":\"" + Instrument.MasterInstrument.Name
+                + "\",\"window\":\"" + WinNames[Math.Min(_nextWin, WinNames.Length - 1)]
+                + "\",\"side\":" + _side + ",\"r30\":" + _r30 + ",\"level\":" + J(_level) + ",\"px\":" + J(px)
+                + ",\"mode\":\"" + FlowGate + "\",\"min_vol\":" + SupportMinVolume + ",\"win_sec\":" + SupportWindowSec;
+        }
+
+        private void FlowLogConfirm(DateTime t, double px, bool supported, long sameVol, long oppVol, int sameCount)
+        {
+            FlowAppend("{\"v\":1,\"type\":\"confirm\"," + FlowCommonJson(t, px)
+                + ",\"supported\":" + (supported ? "true" : "false")
+                + ",\"same_vol\":" + sameVol + ",\"opp_vol\":" + oppVol + ",\"same_n\":" + sameCount + "}");
+        }
+
+        private void FlowLogEntry(DateTime t, double px)
+        {
+            long sv, ov; int sn;
+            bool sup = FlowSupported(_side, t, out sv, out ov, out sn);
+            FlowAppend("{\"v\":1,\"type\":\"entry\"," + FlowCommonJson(t, px)
+                + ",\"via\":\"" + _entryVia + "\",\"supported\":" + (sup ? "true" : "false")
+                + ",\"same_vol\":" + sv + ",\"opp_vol\":" + ov + ",\"same_n\":" + sn + "}");
+        }
+
+        private void FlowLogTradeClose(DateTime t, string exitName)
+        {
+            FlowAppend("{\"v\":1,\"type\":\"trade_close\",\"t\":\"" + JT(t)
+                + "\",\"instrument\":\"" + Instrument.MasterInstrument.Name
+                + "\",\"window\":\"" + WinNames[Math.Min(_nextWin, WinNames.Length - 1)]
+                + "\",\"via\":\"" + _entryVia + "\",\"exit\":\"" + exitName + "\"}");
+        }
+
+        private void FlowOpenTrack(string id, DateTime t, int side, double px)
+        {
+            if (_flowTracks.Count >= 32)
+            {
+                FlowLogOutcome(_flowTracks[0], "overflow", (t - _flowTracks[0].T0).TotalSeconds);
+                _flowTracks.RemoveAt(0);
+            }
+            _flowTracks.Add(new FlowTrack { Id = id, T0 = t, Side = side, Px0 = px });
+        }
+
+        private void FlowTracksUpdate(DateTime t, double px)
+        {
+            for (int i = _flowTracks.Count - 1; i >= 0; i--)
+            {
+                FlowTrack tr = _flowTracks[i];
+                double fav = (px - tr.Px0) * tr.Side;
+                if (fav > tr.MaxFav) tr.MaxFav = fav;
+                if (fav < tr.MinFav) tr.MinFav = fav;
+                double secs = (t - tr.T0).TotalSeconds;
+                if (secs >= 30 && !tr.C30) { tr.C30 = true; tr.Fav30 = tr.MaxFav; tr.Adv30 = tr.MinFav; }
+                if (secs >= 60 && !tr.C60) { tr.C60 = true; tr.Fav60 = tr.MaxFav; tr.Adv60 = tr.MinFav; }
+                if (secs >= 120 && !tr.C120) { tr.C120 = true; tr.Fav120 = tr.MaxFav; tr.Adv120 = tr.MinFav; }
+                if (secs >= 600)
+                {
+                    FlowLogOutcome(tr, "tracked", secs);
+                    _flowTracks.RemoveAt(i);
+                }
+            }
+        }
+
+        private void FlowFlushTracks(string how)
+        {
+            foreach (FlowTrack tr in _flowTracks)
+                FlowLogOutcome(tr, how,
+                    _lastTick == DateTime.MinValue ? 0 : (_lastTick - tr.T0).TotalSeconds);
+            _flowTracks.Clear();
+        }
+
+        // "secs" = track age at close: a checkpoint is only genuine when
+        // secs >= its horizon (truncated tracks would otherwise fake flat
+        // checkpoints — review 2026-08-02).
+        private void FlowLogOutcome(FlowTrack tr, string how, double ageSecs)
+        {
+            FlowAppend("{\"v\":1,\"type\":\"outcome\",\"id\":\"" + tr.Id + "\",\"t0\":\"" + JT(tr.T0)
+                + "\",\"side\":" + tr.Side + ",\"px0\":" + J(tr.Px0)
+                + ",\"secs\":" + (int)Math.Max(0, ageSecs)
+                + ",\"mfe30_t\":" + FlowTicks(tr.C30 ? tr.Fav30 : tr.MaxFav) + ",\"mae30_t\":" + FlowTicks(tr.C30 ? tr.Adv30 : tr.MinFav)
+                + ",\"mfe60_t\":" + FlowTicks(tr.C60 ? tr.Fav60 : tr.MaxFav) + ",\"mae60_t\":" + FlowTicks(tr.C60 ? tr.Adv60 : tr.MinFav)
+                + ",\"mfe120_t\":" + FlowTicks(tr.C120 ? tr.Fav120 : tr.MaxFav) + ",\"mae120_t\":" + FlowTicks(tr.C120 ? tr.Adv120 : tr.MinFav)
+                + ",\"mfe600_t\":" + FlowTicks(tr.MaxFav) + ",\"mae600_t\":" + FlowTicks(tr.MinFav)
+                + ",\"how\":\"" + how + "\"}");
+        }
+
+        private int FlowTicks(double points)
+        {
+            return (int)Math.Round(points / TickSize);
         }
 
         #region Properties
@@ -903,6 +1304,22 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Show drawings", GroupName = "06. Visuals", Order = 0)]
         public bool ShowDrawings { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Flow gate mode", Description = "Big-print support gate on the breakout (needs live/Playback L1 tape; historical bars trade as v3). Off = module dormant. LogOnly = log the verdict per confirmed break, trade pure v3. Filter = enter ONLY breaks supported by big prints. Trigger = Filter + a fresh supporting cluster since the break enters at once, no hold wait.", GroupName = "07. Flow gate", Order = 0)]
+        public LatigoFlowGateMode FlowGate { get; set; }
+
+        [NinjaScriptProperty, Range(1, 100000)]
+        [Display(Name = "Support min volume (contracts)", Description = "A sweep cluster (same-side prints, <=150ms gaps) counts as big-print support at this total size. Reopen-tape scale, not RTH scale — the observed 18:00 NQ cases ran 50-93 contracts.", GroupName = "07. Flow gate", Order = 1)]
+        public int SupportMinVolume { get; set; }
+
+        [NinjaScriptProperty, Range(5, 900)]
+        [Display(Name = "Support window (s)", Description = "Rolling window of fired clusters consulted at decision time. Same-side volume must reach the minimum AND outweigh the opposite side.", GroupName = "07. Flow gate", Order = 2)]
+        public int SupportWindowSec { get; set; }
+
+        [NinjaScriptProperty, Range(0, 5000)]
+        [Display(Name = "Cluster gap (ms)", Description = "Max gap between same-side prints folded into one sweep cluster (BigPrints default 150).", GroupName = "07. Flow gate", Order = 3)]
+        public int ClusterMilliseconds { get; set; }
         #endregion
     }
 }
