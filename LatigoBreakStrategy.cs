@@ -525,7 +525,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             _phase = Phase.Armed;
             _insidePrev = true;
-            Print($"{Name}: candle frozen H={_h} L={_l} R30={_r30}t");
+            Print($"{Name}: candle frozen H={_h} L={_l} R30={_r30}t — entry needs hold {HoldSeconds}s AND {NeedExtTicks()}t ({NeedExtTicks() * TickSize:F2} pts) beyond the level.");
             if (ShowDrawings && ChartControl != null)
             {
                 DateTime end = _w0.AddSeconds(_wDeadlineSecs);
@@ -541,12 +541,22 @@ namespace NinjaTrader.NinjaScript.Strategies
             return ticks > 0 ? ticks : 0;
         }
 
+        // Extension leg of the confirm, in ticks. Scales with R30, so the SAME
+        // ExtensionR30 means a wildly different chase at CandleSeconds=30 (what
+        // the research calibrated) vs 300 — hence it is printed, not implied.
+        private int NeedExtTicks()
+        {
+            return UseWhipsawFilter ? (int)Math.Ceiling(ExtensionR30 * _r30) : 0;
+        }
+
+        // HoldSeconds is a FLOOR, not the trigger: the entry needs the hold AND
+        // the extension, and the clock runs from the LATEST break (a whipsaw
+        // re-arm restarts it). Set ExtensionR30 = 0 for hold-only entries.
         private bool ConfirmReady(DateTime t)
         {
             if (!UseWhipsawFilter)
                 return true;
-            int needExt = (int)Math.Ceiling(ExtensionR30 * _r30);
-            return (t - _tBreak).TotalSeconds >= HoldSeconds && _maxExt >= needExt;
+            return (t - _tBreak).TotalSeconds >= HoldSeconds && _maxExt >= NeedExtTicks();
         }
 
         private void OpenBreak(DateTime t, double px, int side)
@@ -610,6 +620,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             // OnExecutionUpdate (live-until-cancelled Exit orders, hand-draggable).
             _stopPx = 0; _targetPx = 0;
             _beApplied = false;
+
+            // Which leg made us wait — the question the chart cannot answer.
+            Print(string.Format(CultureInfo.InvariantCulture,
+                "{0}: entry {1:HH:mm:ss} — {2:F0}s since the LAST break at {3} (hold {4}s), extension {5}t of {6}t needed, chasing {7}t from level {8}.",
+                Name, t, (t - _tBreak).TotalSeconds, _breakPx, HoldSeconds,
+                _maxExt, NeedExtTicks(), ExtTicks(px), _level));
 
             _entryPending = true;                    // BEFORE Enter* — order-event race
             _phase = Phase.Pending;
