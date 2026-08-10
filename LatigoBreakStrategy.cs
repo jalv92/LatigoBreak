@@ -1352,7 +1352,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int HoldSeconds { get; set; }
 
         [NinjaScriptProperty, Range(0, 3)]
-        [Display(Name = "Extension (xR30)", Description = "Required max excursion beyond the level, as a fraction of the opening candle range. Best Phase-1 cell: 0.25.", GroupName = "02. Signal", Order = 2)]
+        [Display(Name = "Extension (xR30)", Description = "Required max excursion beyond the level, as a fraction of the opening candle range — it puts a FLOOR on how far price must run before you are filled, so it costs entry price, it does not filter fakes (the hold does that). Scales with Candle seconds: 0.25 was the Phase-1 cell at 30s and is several times larger at 300s. 0 = hold-only entry. Watch the frozen-candle Print for the tick figure.", GroupName = "02. Signal", Order = 2)]
         public double ExtensionR30 { get; set; }
 
         [NinjaScriptProperty, Range(5, 300)]
