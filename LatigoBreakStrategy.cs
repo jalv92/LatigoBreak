@@ -114,19 +114,29 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool _dailyLockout;
 
         // Shared (account-wide) mode: STATIC registry = shared across every instance of THIS
-        // strategy class in the NT8 process. One entry per account: trading day, day baseline
-        // (first instance writes it, later ones ADOPT it), and the breach broadcast. Re-read
-        // under lock on every tick — never cached — so a wipe-and-recreate can't split the
-        // group, and a peak seen only by another instrument's ticks still locks this one out.
+        // strategy class in the NT8 process. One entry per account: trading day, the per-
+        // instance day-PnL contributions, and the breach broadcast. Re-read under lock on
+        // every tick — never cached — so a wipe-and-recreate can't split the group, and a
+        // peak seen only by another instrument's ticks still locks this one out.
+        //
+        // Why contributions and not Account.Get(Realized)+Get(Unrealized): those are two
+        // separately-updated aggregates. The instant a winner's target fills, realized is
+        // already credited while account unrealized still carries the closed position, so
+        // the sum double-counts that trade and fires the profit target early (seen live
+        // 2026-08-10: $750 target flattened everything at $539 realized — the phantom was
+        // the $371 MNQ winner counted twice). Each instance's own SystemPerformance +
+        // Position pair is event-ordered on its strategy thread, so per-instance numbers
+        // are internally consistent; the shared sum inherits that.
         private sealed class AcctDayGov
         {
             public DateTime Day;
-            public double Baseline;
             public volatile bool Breached;
+            public readonly Dictionary<string, double> PnL = new Dictionary<string, double>();
         }
         private static readonly object _acctGovLock = new object();
         private static readonly Dictionary<string, AcctDayGov> _acctGov = new Dictionary<string, AcctDayGov>();
         private DateTime _acctSessionDay = DateTime.MinValue;
+        private string _govKey;                     // set at DataLoaded (needs Instrument)
 
         // --- v4 flow gate: big-print support detection (BigPrints tape port) ---
         // OnMarketData (market-data thread) classifies aggressor prints and folds
@@ -240,6 +250,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 _sess = new SessionIterator(BarsArray[TickIdx]);
                 _atrSeries = new Series<double>(this);
+                // Per-instance registry key. Instrument name for the breach log's
+                // readability + a random suffix so two instances on the SAME
+                // instrument/account never overwrite each other's contribution.
+                _govKey = Instrument.FullName + "/" + Guid.NewGuid().ToString("N").Substring(0, 4);
                 // Playback rewinds reset the account — start the shared governor clean
                 if (Account != null)
                     lock (_acctGovLock) _acctGov.Remove(Account.Name);
@@ -803,16 +817,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return null;
                 if (g == null || g.Day < _acctSessionDay)
                 {
-                    g = new AcctDayGov
-                    {
-                        Day = _acctSessionDay,
-                        Baseline = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar),
-                        Breached = false,
-                    };
+                    g = new AcctDayGov { Day = _acctSessionDay, Breached = false };
                     _acctGov[Account.Name] = g;
                 }
                 return g;
             }
+        }
+
+        // This instance's day PnL from its OWN event-ordered state (SystemPerformance
+        // and Position are both current by the time OnBarUpdate runs) — never from the
+        // account aggregates, whose realized/unrealized pair is not a consistent
+        // snapshot around a closing fill.
+        private double OwnDayPnL()
+        {
+            double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit - _dayStartRealized;
+            double unrealized = Position.MarketPosition != MarketPosition.Flat
+                ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
+                : 0.0;
+            return realized + unrealized;
         }
 
         private void CheckRiskGovernor()
@@ -833,23 +855,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Lockout("account-wide breach broadcast received");
                 return;
             }
-            if (DailyProfitTargetUSD <= 0 && DailyLossLimitUSD <= 0)
-                return;
+            string detail = null;
             if (gov != null)
             {
+                // Publish own PnL BEFORE the limits-off return: an instance with its
+                // own limits disabled must still count toward the others' shared sum.
                 sharedMode = true;
-                double realized = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar) - gov.Baseline;
-                double unrealized = Account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
-                dayPnL = realized + unrealized;
+                double own = OwnDayPnL();
+                lock (_acctGovLock)
+                {
+                    gov.PnL[_govKey] = own;
+                    dayPnL = 0;
+                    foreach (double v in gov.PnL.Values)
+                        dayPnL += v;
+                }
             }
             else
-            {
-                double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit - _dayStartRealized;
-                double unrealized = Position.MarketPosition != MarketPosition.Flat
-                    ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
-                    : 0.0;
-                dayPnL = realized + unrealized;
-            }
+                dayPnL = OwnDayPnL();
+            if (DailyProfitTargetUSD <= 0 && DailyLossLimitUSD <= 0)
+                return;
 
             bool hitTarget = DailyProfitTargetUSD > 0 && dayPnL >= DailyProfitTargetUSD;
             bool hitLoss = DailyLossLimitUSD > 0 && dayPnL <= -DailyLossLimitUSD;
@@ -857,9 +881,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             if (sharedMode)
+            {
                 gov.Breached = true;                 // broadcast to every other instance
-            Lockout(string.Format("daily {0} hit ({1:F2} USD{2})",
-                hitTarget ? "profit target" : "loss limit", dayPnL, sharedMode ? ", account-wide" : ""));
+                var sb = new System.Text.StringBuilder(" [");
+                lock (_acctGovLock)
+                    foreach (KeyValuePair<string, double> kv in gov.PnL)
+                        sb.Append(kv.Key).Append(' ').Append(kv.Value.ToString("F2")).Append("; ");
+                detail = sb.Append(']').ToString();
+            }
+            Lockout(string.Format("daily {0} hit ({1:F2} USD{2}{3})",
+                hitTarget ? "profit target" : "loss limit", dayPnL,
+                sharedMode ? ", account-wide" : "", detail ?? ""));
         }
 
         private void Lockout(string reason)
@@ -1404,7 +1436,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         public double DailyLossLimitUSD { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Account-wide (all markets)", Description = "Watch the ACCOUNT's combined day PnL: every instance of this strategy on the account flattens together on a breach (BigPrints shared governor). OFF = this instance's own PnL only.", GroupName = "05. Daily limits", Order = 2)]
+        [Display(Name = "Account-wide (all markets)", Description = "Sum the day PnL of EVERY instance of this strategy on the account: all flatten together on a breach (shared governor). OFF = this instance's own PnL only.", GroupName = "05. Daily limits", Order = 2)]
         public bool UseAccountDailyPnL { get; set; }
 
         [NinjaScriptProperty]
