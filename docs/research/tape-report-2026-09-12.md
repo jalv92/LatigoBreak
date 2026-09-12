@@ -119,3 +119,40 @@ candle is narrower) and `EntryWindowMinutes` (stop hunting after N minutes).
   of tape before they are a result. Pre-registered here so the next check is
   honest: stop 2.0, target 2xATR, Window 5, MinR30 80. Kill if PF < 1.2 on the
   next 100 trades.
+
+## 4. Prop-firm check of the pre-registered settings (`research/prop_check.py`)
+
+Settings shipped as `SetDefaults` the same day: 18:00 only, stop 2.0xATR, target
+2.0xATR, `EntryWindowMinutes` 5, `MinR30Ticks` 80, governor off, 1 NQ. ALL:
+69 trades in 275 sessions (one every ~4 sessions), win 68%, R 1.11, avg loss
+$446, worst stop -$1,236, PF 2.38, +$13,543. Longest losing streak 5, worst
+5-trade run -$2,749, deepest closed-trade drawdown **-$3,644** (2026-02/03).
+
+`sim.replay` walks the real sequence through each firm's rules once:
+
+| Account (eval) | target / max DD | 1 NQ | 1 MNQ (x0.1) |
+|---|---|---|---|
+| Lucid 50K (daily DLL on or off) | $3,000 / $2,000 | **busted** 2026-03-01 (floor at the close) | open, +$1,354, low -$131 |
+| Apex 50K, Topstep 50K, MFF 50K rapid, TPT 50K | $3,000 / $2,000 | **busted** same day | |
+| Lucid 100K | $6,000 / $3,000 | **busted** 2026-03-01 | |
+| Lucid 150K | $9,000 / $4,500 | passed 2026-06-07, low -$1,314, margin $683 | |
+| Apex 150K | $9,000 / $4,000 | passed 2026-06-07, margin $183 | |
+
+The parametric Monte Carlo (Bernoulli on win rate / R / avg loss) says P(pass)
+88-94% on a 50K: it is wrong here, because the losses are not one size. The
+stop is 2xATR of a wide candle, so a loss ranges $221 to $1,236, and the
+2026-02/03 run of them is a $3,644 hole that no $2,000 trailing floor
+survives. **At one NQ contract this setup does not fit a 50K or 100K
+evaluation; it fits a 150K with little margin, or a 50K on MNQ where the
+profit ($1,354 in a year) is too slow to matter.** The equity curve is
+positive; the account envelope is not.
+
+## Shipped
+
+`LatigoBreakStrategy.cs` `SetDefaults` = the settings above (was: three
+windows on, 30-minute hunt, MinR30 4, governor 500/300). PropSim's
+`engine.LatigoBreak` defaults track it (closed parameter list). Deployed to
+`Custom/Strategies/` 2026-09-12, `cmp`-equal, no duplicate basenames. PropSim
+`engine.py --selfcheck` fails on a pre-existing ORB tick-size assertion
+(`_wmeta["tick_size"] == 1.00`), reproduced on the committed file: not from
+this change.

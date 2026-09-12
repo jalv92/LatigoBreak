@@ -209,16 +209,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 BarsRequiredToTrade = 0;
                 IsInstantiatedOnEachOptimizationIteration = false;
 
+                // Defaults = the settings pre-registered on the tick tape 2026-09-12
+                // (docs/research/tape-report-2026-09-12.md): 18:00 only, hunt 5 min,
+                // skip narrow reopen candles, governor off. 275 sessions in-sample:
+                // 69 trades, PF 2.4; the out-of-sample check is the Playback routine.
                 TradeGlobexReopen = true;
-                TradeEvening = true;
-                TradeUsOpen = true;
-                EntryWindowMinutes = 30;
+                TradeEvening = false;
+                TradeUsOpen = false;
+                EntryWindowMinutes = 5;
 
                 UseWhipsawFilter = true;
                 HoldSeconds = 30;
                 ExtensionR30 = 0.25;
                 CandleSeconds = 30;
-                MinR30Ticks = 4;
+                MinR30Ticks = 80;
 
                 Contracts = 1;
                 AtrPeriod = 14;
@@ -230,8 +234,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 BreakevenPercent = 50;
                 BreakevenOffsetTicks = 0;
 
-                DailyProfitTargetUSD = 500;
-                DailyLossLimitUSD = 300;
+                DailyProfitTargetUSD = 0;           // off: one trade per session, the bracket is the governor
+                DailyLossLimitUSD = 0;
                 UseAccountDailyPnL = false;         // multi-market shared close OFF by default
 
                 FlowGate = LatigoFlowGateMode.Filter;
