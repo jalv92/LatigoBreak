@@ -5,3 +5,4 @@ research/out/
 research/data/
 *.pkl
 *.csv.gz
+tmp/
