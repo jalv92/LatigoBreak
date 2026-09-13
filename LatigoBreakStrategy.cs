@@ -240,7 +240,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DailyLossLimitUSD = 0;
                 UseAccountDailyPnL = false;         // multi-market shared close OFF by default
 
-                FlowGate = LatigoFlowGateMode.Filter;
+                FlowGate = LatigoFlowGateMode.Off;          // v3 pure = what the tick tape measured; Filter/Trigger are unvalidated (flow-scan-report.md)
                 SupportMinVolume = 50;              // reopen-tape scale (Javier's cases: 50-93c) — NOT BigPrints' RTH 150
                 SupportWindowSec = 120;
                 ClusterMilliseconds = 150;
