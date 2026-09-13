@@ -153,6 +153,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private volatile int _flowEpoch;             // bumped on every reset; stale in-flight clusters stamp the old value
         private int _fEpoch;                         // market-data thread's snapshot, taken at each OnMarketData entry
         private int _flowClustersEverFired;          // diagnostic only, tearing tolerated
+        private long _flowBiggestClusterSeen;         // diagnostic: largest same-side cluster, fired or not
 
         private sealed class FlowCluster
         {
@@ -624,7 +625,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!sup && _flowClustersEverFired == 0 && !_noTapeWarned)
             {
                 _noTapeWarned = true;
-                Print($"{Name}: flow gate has seen ZERO clusters this session — check that the feed carries L1 bid/ask.");
+                // Biggest = 0 with prints flowing means no bid/ask on the feed; biggest > 0
+                // means the tape was fine and simply had no cluster this large (2026-09-01
+                // 18:00: 422 contracts in 105 s, biggest cluster 19c against a 50c bar).
+                Print($"{Name}: flow gate has fired ZERO clusters this session — biggest same-side cluster so far {_flowBiggestClusterSeen}c vs Support min volume {SupportMinVolume}c" +
+                      (_flowBiggestClusterSeen == 0 ? " — check that the feed carries L1 bid/ask." : " — the tape is fine, the bar was not reached."));
             }
         }
 
@@ -1175,6 +1180,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!_fClusterOpen)
                 return;
             _fClusterOpen = false;
+            if (_fClusterVolume > _flowBiggestClusterSeen)
+                _flowBiggestClusterSeen = _fClusterVolume;
             if (_fClusterVolume < SupportMinVolume)
                 return;
             System.Threading.Interlocked.Increment(ref _flowClustersEverFired);
