@@ -212,3 +212,26 @@ a start in 2026-02 meets the $2.8k drawdown first):
 | Lucid 50K | 2 NQ | 2025-11-13 | $671 |
 | Lucid 100K | 2 NQ | 2025-11-19 | $1,321 |
 | Lucid 150K | 3 NQ | 2025-11-19 | $1,982 |
+
+## 7. The entry-window ladder (MinR30 4, 2xATR/2xATR, ALL)
+
+Javier showed a Playback night where three breaks below the 18:00 candle were
+vetoed as whipsaws in the first three minutes, the 5-minute window closed, and
+the market then fell 20 points from 18:46. What the extra minutes buy, on the
+whole tape:
+
+| Window | n | PF | net | max DD | Lucid 50K |
+|---|---|---|---|---|---|
+| 5 | 145 | 1.93 | +$15,160 | -$2,843 | passed |
+| 10 | 172 | 1.41 | +$9,769 | -$4,896 | passed |
+| 15 | 186 | 1.44 | +$10,929 | -$4,375 | passed |
+| 20 | 193 | 1.37 | +$9,918 | -$4,375 | passed |
+| 30 | 202 | 1.33 | +$9,176 | -$4,063 | busted |
+| 60 | 209 | 1.38 | +$10,901 | -$4,154 | busted |
+
+Every minute past the fifth adds trades that lose in aggregate: the 57 extra
+trades between Window 5 and Window 30 net -$6,000, about -$105 each, and
+deepen the drawdown by $1,200-2,000. The screenshot's trade is one of those 57
+that would have paid; the tape says its siblings do not. OOS (27 sessions):
+Window 5 PF 1.19, Window 10 PF 1.33, Window 15 PF 1.00, Window 30 PF 1.15 --
+too few trades to separate them.
