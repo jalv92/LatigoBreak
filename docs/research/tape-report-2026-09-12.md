@@ -177,3 +177,38 @@ pre-registration becomes: stop 2.0, target 2xATR, Window 5, MinR30 4; kill if
 PF < 1.2 on the next 100 trades. OOS (27 sessions) for this row: n=14, PF 1.19,
 +$374 -- an observation. The candle-width finding stays in section 2 as
 information about which breaks pay, not as a filter.
+
+## 6. "Trading more": the other windows, measured (Window 5, MinR30 4, 2xATR/2xATR)
+
+Javier's objection: ~12 trades a month is not enough, and the goal was better
+entries, not fewer. The only ways to add trades inside this design are the
+other two windows and re-arming. ALL (275 sessions) with the 50K replay:
+
+| Windows | n | win | net | avg | PF | max DD | Lucid 50K |
+|---|---|---|---|---|---|---|---|
+| 18:00 only | 145 | 64% | +$15,160 | $105 | 1.93 | -$2,843 | passed |
+| 20:00 only | 176 | 57% | -$484 | -$3 | 0.98 | -$3,374 | busted |
+| 09:30 only | 179 | 56% | -$1,401 | -$8 | 0.97 | -$7,789 | passed |
+| 18:00 + 20:00 | 320 | 60% | +$14,117 | $44 | 1.37 | -$3,277 | busted |
+| 18:00 + 09:30 | 324 | 60% | +$13,759 | $42 | 1.20 | -$5,425 | passed |
+| all three | 499 | 59% | +$12,716 | $25 | 1.14 | -$6,331 | passed |
+| 18:00, max 2 trades/window | 152 | 64% | +$14,864 | $98 | 1.87 | -$2,843 | passed |
+| all three, Window 30 | 640 | 56% | +$4,324 | $7 | 1.04 | -$10,977 | passed |
+
+Out-of-sample (27 sessions): 20:00 PF 0.57, 09:30 PF 0.81, 18:00 PF 1.19.
+
+**The edge is the 18:00 reopen and nothing else.** The 20:00 and 09:30
+windows are coin flips after costs on both tapes; adding them adds trades,
+adds drawdown, and leaves the year's profit where it was. Re-arming adds 7
+trades a year. This setup has ~12 trades a month in it; more trades means a
+different setup for the other hours, not this one with more windows.
+
+Replay of 18:00-only through evals, starting 2025-08-03 (a favourable stretch;
+a start in 2026-02 meets the $2.8k drawdown first):
+
+| Account | contracts | passed | margin to the floor |
+|---|---|---|---|
+| Lucid 50K / Apex 50K | 1 NQ | 2025-11-19 (59th trading day) | $1,161 |
+| Lucid 50K | 2 NQ | 2025-11-13 | $671 |
+| Lucid 100K | 2 NQ | 2025-11-19 | $1,321 |
+| Lucid 150K | 3 NQ | 2025-11-19 | $1,982 |
