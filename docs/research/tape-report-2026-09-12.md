@@ -261,3 +261,24 @@ the rows do not separate. What the last 30 days agree with the full tape on:
 18:00 is the only window that pays, stop 2.0 beats 1.5, the whipsaw filter
 neither helps nor hurts. Rows that look better here (Window 10 + max 2, target
 3xATR, hold 60 s) are watch items for Playback, not default changes.
+
+## 9. Two more windows, 10:00 and 14:00 ET (added on request, measured before shipping)
+
+`TradeTenAm` / `TradeTwoPm`, offsets +57600 / +72000 s from the 18:00 begin.
+Window 5, MinR30 4, 2xATR/2xATR, 1 NQ:
+
+| Windows | last 30 days: n / net / PF / max DD | full tape: n / net / PF / max DD |
+|---|---|---|---|
+| 18:00 only | 14 / +$374 / 1.19 / -$777 | 145 / +$15,160 / 1.93 / -$2,843 |
+| 10:00 only | 17 / -$2,403 / 0.71 / -$5,138 | 168 / -$3,238 / 0.95 / -$15,899 |
+| 14:00 only | 20 / -$1,235 / 0.63 / -$1,345 | 177 / -$2,530 / 0.92 / -$3,704 |
+| 18:00 + 10:00 | 31 / -$2,029 / 0.80 / -$5,039 | 313 / +$11,922 / 1.14 / -$13,086 |
+| 18:00 + 14:00 | 34 / -$861 / 0.84 / -$1,749 | 322 / +$12,630 / 1.26 / -$3,737 |
+| all three | 51 / -$3,264 / 0.76 / -$5,142 | 490 / +$9,393 / 1.08 / -$12,227 |
+
+With a 30-minute window: 10:00 PF 1.01 / 0.92, 14:00 PF 0.55 / 0.86. Both new
+windows lose on both frames, and 10:00 carries a -$16k drawdown on the year
+(a 30-second candle at 10:00 sits inside the open's range expansion; the
+2xATR stop is wide and the break has no follow-through). **Shipped OFF by
+default; the checkboxes exist for Playback.** Same conclusion as §6: the
+reopen at 18:00 is the only window where this candle break pays.

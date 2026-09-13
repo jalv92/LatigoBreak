@@ -68,12 +68,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const string SigStop = "LB_Stop";
         private const string SigTarget = "LB_Target";
 
-        // Session windows as seconds from the ETH session begin (18:00 ET):
-        // +0 = 18:00 reopen, +7200 = 20:00, +55800 = 09:30 next morning (same
-        // trading day). DST transitions always fall inside the closed weekend,
-        // so fixed offsets are exact.
-        private static readonly int[] WinOffsetSecs = { 0, 7200, 55800 };
-        private static readonly string[] WinNames = { "18:00", "20:00", "09:30" };
+        // Session windows as seconds from the ETH session begin (18:00 ET), in
+        // trading-day order: +0 = 18:00 reopen, +7200 = 20:00, +55800 = 09:30,
+        // +57600 = 10:00, +72000 = 14:00 (the last three the next calendar
+        // morning/afternoon, same trading day). DST transitions always fall
+        // inside the closed weekend, so fixed offsets are exact.
+        private static readonly int[] WinOffsetSecs = { 0, 7200, 55800, 57600, 72000 };
+        private static readonly string[] WinNames = { "18:00", "20:00", "09:30", "10:00", "14:00" };
 
         private Phase _phase = Phase.Idle;
         private SessionIterator _sess;
@@ -219,6 +220,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TradeGlobexReopen = true;
                 TradeEvening = false;
                 TradeUsOpen = false;
+                TradeTenAm = false;                 // added 2026-09-12; see the tape report for what they measured
+                TradeTwoPm = false;
                 EntryWindowMinutes = 5;
 
                 UseWhipsawFilter = true;
@@ -340,9 +343,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private bool WinEnabled(int i)
         {
-            if (i == 0) return TradeGlobexReopen;
-            if (i == 1) return TradeEvening;
-            return TradeUsOpen;
+            switch (i)
+            {
+                case 0: return TradeGlobexReopen;
+                case 1: return TradeEvening;
+                case 2: return TradeUsOpen;
+                case 3: return TradeTenAm;
+                default: return TradeTwoPm;
+            }
         }
 
         protected override void OnBarUpdate()
@@ -1384,8 +1392,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Display(Name = "Trade 09:30 ET (US open)", Description = "Hunt the opening-candle breakout at the 09:30 ET US equity open (session begin + 15h30m).", GroupName = "01. Sessions", Order = 2)]
         public bool TradeUsOpen { get; set; }
 
+        [NinjaScriptProperty]
+        [Display(Name = "Trade 10:00 ET", Description = "Hunt the opening-candle breakout at 10:00 ET (session begin + 16h).", GroupName = "01. Sessions", Order = 3)]
+        public bool TradeTenAm { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trade 14:00 ET", Description = "Hunt the opening-candle breakout at 14:00 ET (session begin + 20h).", GroupName = "01. Sessions", Order = 4)]
+        public bool TradeTwoPm { get; set; }
+
         [NinjaScriptProperty, Range(1, 480)]
-        [Display(Name = "Entry window (minutes)", Description = "Hunt breaks/entries only this long after each window opens. An OPEN position is never closed by this clock — it runs to stop/target. A window that opens while a position is still on is skipped.", GroupName = "01. Sessions", Order = 3)]
+        [Display(Name = "Entry window (minutes)", Description = "Hunt breaks/entries only this long after each window opens. An OPEN position is never closed by this clock — it runs to stop/target. A window that opens while a position is still on is skipped.", GroupName = "01. Sessions", Order = 5)]
         public int EntryWindowMinutes { get; set; }
 
         [NinjaScriptProperty]
