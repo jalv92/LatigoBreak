@@ -235,3 +235,29 @@ deepen the drawdown by $1,200-2,000. The screenshot's trade is one of those 57
 that would have paid; the tape says its siblings do not. OOS (27 sessions):
 Window 5 PF 1.19, Window 10 PF 1.33, Window 15 PF 1.00, Window 30 PF 1.15 --
 too few trades to separate them.
+
+## 8. Last 30 days only (Javier's frame from here on: 2026-08-05..09-04, 27 sessions)
+
+The tape ends 2026-09-04; extend it with NT8 Historical Data -> Download (Tick,
+Last) and `tape.build_cache("NQ 09-26")`. 18:00 only, MinR30 4, 1 NQ:
+
+| Variant | n | win | net | PF | max DD |
+|---|---|---|---|---|---|
+| **defaults: Window 5, stop/target 2xATR** | 14 | 50% | +$374 | 1.19 | -$777 |
+| Window 10 | 15 | 53% | +$664 | 1.33 | -$777 |
+| Window 30 | 21 | 52% | +$429 | 1.15 | -$777 |
+| Window 5, max 2 trades | 15 | 53% | +$634 | 1.31 | -$522 |
+| Window 10, max 2 trades | 17 | 59% | +$1,242 | 1.62 | -$522 |
+| stop 1.5xATR | 14 | 29% | -$491 | 0.78 | -$753 |
+| target 3xATR | 14 | 50% | +$1,649 | 1.82 | -$777 |
+| hold 60 s | 12 | 58% | +$1,156 | 1.83 | -$767 |
+| hold 15 s | 14 | 43% | -$156 | 0.93 | -$812 |
+| no whipsaw filter | 19 | 58% | +$411 | 1.19 | -$785 |
+| MinR30 80 | 7 | 57% | +$900 | 1.99 | -$326 |
+| 20:00 only / 09:30 only / all three | 18 / 19 / 51 | | -$1,394 / -$1,214 / -$2,234 | 0.57 / 0.81 / 0.81 | |
+
+Every 18:00 row is 12-21 trades: one $400 trade moves PF from 1.2 to 1.8, so
+the rows do not separate. What the last 30 days agree with the full tape on:
+18:00 is the only window that pays, stop 2.0 beats 1.5, the whipsaw filter
+neither helps nor hurts. Rows that look better here (Window 10 + max 2, target
+3xATR, hold 60 s) are watch items for Playback, not default changes.
