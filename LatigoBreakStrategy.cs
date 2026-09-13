@@ -211,8 +211,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // Defaults = the settings pre-registered on the tick tape 2026-09-12
                 // (docs/research/tape-report-2026-09-12.md): 18:00 only, hunt 5 min,
-                // skip narrow reopen candles, governor off. 275 sessions in-sample:
-                // 69 trades, PF 2.4; the out-of-sample check is the Playback routine.
+                // governor off. 275 sessions in-sample: 145 trades, PF 1.9, max DD
+                // $2.8k, passes a 50K eval replay. MinR30Ticks stays 4: a wide-candle
+                // filter (80) raised PF to 2.4 but deepened the drawdown to $3.6k and
+                // busted every 50K -- it removes the small trades that smooth the curve.
                 TradeGlobexReopen = true;
                 TradeEvening = false;
                 TradeUsOpen = false;
@@ -222,7 +224,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 HoldSeconds = 30;
                 ExtensionR30 = 0.25;
                 CandleSeconds = 30;
-                MinR30Ticks = 80;
+                MinR30Ticks = 4;
 
                 Contracts = 1;
                 AtrPeriod = 14;

@@ -156,3 +156,24 @@ windows on, 30-minute hunt, MinR30 4, governor 500/300). PropSim's
 `engine.py --selfcheck` fails on a pre-existing ORB tick-size assertion
 (`_wmeta["tick_size"] == 1.00`), reproduced on the committed file: not from
 this change.
+
+## 5. Correction the same evening: MinR30 80 deepens the drawdown
+
+Javier asked whether the filter trades too little (one trade per ~4 sessions).
+Re-running the ladder with the 50K replay attached:
+
+| MinR30 (Window 5, stop/target 2xATR) | n | PF | net | max closed DD | Lucid 50K replay |
+|---|---|---|---|---|---|
+| 4 | 145 | 1.93 | +$15,160 | -$2,843 | passed |
+| 40 | 129 | 2.02 | +$15,442 | -$2,550 | passed |
+| 60 | 93 | 2.33 | +$15,944 | -$2,749 | passed |
+| 80 | 69 | 2.38 | +$13,543 | -$3,644 | busted |
+
+The candle-width filter raises the per-trade average and leaves the net where
+it was: what it removes are the small trades that smooth the curve, what it
+keeps are the wide-candle trades with the big stops. **Shipped defaults are
+now `MinR30Ticks` 4 (unchanged from v3) and `EntryWindowMinutes` 5.** The
+pre-registration becomes: stop 2.0, target 2xATR, Window 5, MinR30 4; kill if
+PF < 1.2 on the next 100 trades. OOS (27 sessions) for this row: n=14, PF 1.19,
++$374 -- an observation. The candle-width finding stays in section 2 as
+information about which breaks pay, not as a filter.
