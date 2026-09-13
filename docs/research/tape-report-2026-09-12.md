@@ -282,3 +282,34 @@ windows lose on both frames, and 10:00 carries a -$16k drawdown on the year
 2xATR stop is wide and the break has no follow-through). **Shipped OFF by
 default; the checkboxes exist for Playback.** Same conclusion as §6: the
 reopen at 18:00 is the only window where this candle break pays.
+
+## 10. 14:00 replaced by 11:00, 15:50 added, mandatory 16:15 flatten
+
+Javier's revision the same evening: drop the 14:00 window, add 11:00 and
+15:50, and flatten EVERYTHING at 16:15 ET, no exceptions. Shipped as
+`TradeElevenAm` / `TradeThreeFifty` (offsets +61200 / +78600) and
+`HardFlattenHHMM` (default 1615, cannot be switched off, routed through the
+governor's `Lockout` so it retries until flat and blocks further windows).
+PropSim mirror: `trade_eleven_am` / `trade_three_fifty` / `flatten_hhmm=1615`
+(fixed); `engine.resolve` grew `flatten_offset_s` so the wall is read on the
+18:00-based trading day (and a wrapped-slice bug found on the way: 12 of 202
+15:50 trades sailed past the wall until the search was confined to the
+trading day). Verified: latest exit of any 15:50 trade is 16:15:00.
+
+Window 5, MinR30 4, 2xATR/2xATR, 1 NQ, wall 16:15:
+
+| Windows | last 30 days: n / net / PF / max DD | full tape: n / net / PF / max DD |
+|---|---|---|---|
+| 18:00 only (wall changes nothing: no 18:00 trade lives to the afternoon) | 14 / +$374 / 1.19 / -$777 | 145 / +$15,160 / 1.93 / -$2,843 |
+| 11:00 only | 21 / -$176 / 0.97 / -$2,700 | 183 / -$9,804 / 0.82 / -$10,948 |
+| 15:50 only | 14 / +$374 / 1.20 / -$932 | 133 / -$5,236 / 0.83 / -$11,901 |
+| 18:00 + 11:00 | 35 / +$198 / 1.03 / -$3,108 | 328 / +$5,356 / 1.07 / -$7,446 |
+| 18:00 + 15:50 | 28 / +$749 / 1.19 / -$1,710 | 278 / +$9,924 / 1.21 / -$12,621 |
+| 18:00 + 11:00 + 15:50 | 49 / +$573 / 1.06 / -$2,360 | 461 / +$120 / 1.00 / -$16,558 |
+| 11:00 only, Window 30 | 22 / -$737 / 0.88 | 218 / -$2,936 / 0.95 |
+| 15:50 only, Window 15 | 20 / -$580 / 0.83 | 202 / -$929 / 0.98 |
+
+15:50 shows +$374 on the last 30 days (14 trades) and -$5,236 on the year;
+11:00 loses on both. **Both shipped OFF by default.** Six windows measured
+now; the 18:00 reopen remains the only one where the 30-second candle break
+pays.

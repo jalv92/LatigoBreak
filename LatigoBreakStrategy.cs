@@ -70,11 +70,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // Session windows as seconds from the ETH session begin (18:00 ET), in
         // trading-day order: +0 = 18:00 reopen, +7200 = 20:00, +55800 = 09:30,
-        // +57600 = 10:00, +72000 = 14:00 (the last three the next calendar
-        // morning/afternoon, same trading day). DST transitions always fall
-        // inside the closed weekend, so fixed offsets are exact.
-        private static readonly int[] WinOffsetSecs = { 0, 7200, 55800, 57600, 72000 };
-        private static readonly string[] WinNames = { "18:00", "20:00", "09:30", "10:00", "14:00" };
+        // +57600 = 10:00, +61200 = 11:00, +78600 = 15:50 (the last four the next
+        // calendar day, same trading day). DST transitions always fall inside
+        // the closed weekend, so fixed offsets are exact.
+        private static readonly int[] WinOffsetSecs = { 0, 7200, 55800, 57600, 61200, 78600 };
+        private static readonly string[] WinNames = { "18:00", "20:00", "09:30", "10:00", "11:00", "15:50" };
 
         private Phase _phase = Phase.Idle;
         private SessionIterator _sess;
@@ -221,8 +221,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TradeEvening = false;
                 TradeUsOpen = false;
                 TradeTenAm = false;                 // added 2026-09-12; see the tape report for what they measured
-                TradeTwoPm = false;
+                TradeElevenAm = false;
+                TradeThreeFifty = false;
                 EntryWindowMinutes = 5;
+                HardFlattenHHMM = 1615;             // MANDATORY (Javier 2026-09-12): everything flat at 16:15 ET
 
                 UseWhipsawFilter = true;
                 HoldSeconds = 30;
@@ -349,7 +351,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 case 1: return TradeEvening;
                 case 2: return TradeUsOpen;
                 case 3: return TradeTenAm;
-                default: return TradeTwoPm;
+                case 4: return TradeElevenAm;
+                default: return TradeThreeFifty;
             }
         }
 
@@ -387,6 +390,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             CheckRiskGovernor();                     // real-time daily limits — runs in EVERY phase
+            CheckHardFlatten(t);                     // 16:15 ET wall: flat, no more hunting today
             FlowTracksUpdate(t, px);                 // forward MFE/MAE for logged breaks
 
             // An open position is never closed by the clock (v3): it runs to
@@ -526,6 +530,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 want = Math.Min(want, WinOffsetSecs[j] - WinOffsetSecs[_nextWin]);
                 break;
             }
+            want = Math.Min(want, HardFlattenOffsetSecs() - WinOffsetSecs[_nextWin]);
             if (Math.Abs(want - configured) > 0.5)
                 Print($"{Name}: effective entry window {want:F0}s (configured {configured:F0}s — floored by candle / capped by next window).");
             return want;
@@ -911,6 +916,26 @@ namespace NinjaTrader.NinjaScript.Strategies
             Lockout(string.Format("daily {0} hit ({1:F2} USD{2}{3})",
                 hitTarget ? "profit target" : "loss limit", dayPnL,
                 sharedMode ? ", account-wide" : "", detail ?? ""));
+        }
+
+        // Seconds from the 18:00 session begin to the hard-flatten wall. 16:15 is
+        // 22h15m after the reopen; a wall set before 18:00 wraps to the next day.
+        private int HardFlattenOffsetSecs()
+        {
+            int secs = (HardFlattenHHMM / 100) * 3600 + (HardFlattenHHMM % 100) * 60 - 18 * 3600;
+            return secs < 0 ? secs + 86400 : secs;
+        }
+
+        // The mandatory wall (Javier, 2026-09-12): at HardFlattenHHMM every position
+        // goes flat and nothing arms until the next session. Routed through Lockout
+        // on purpose -- it already retries the flatten until flat, abandons a hunt in
+        // progress and lets the fill bookkeeping finish a pending entry, and
+        // ResetSession clears it at the next 18:00. One Print per session.
+        private void CheckHardFlatten(DateTime t)
+        {
+            if (_dailyLockout || t < _t0.AddSeconds(HardFlattenOffsetSecs()))
+                return;
+            Lockout($"hard flatten {HardFlattenHHMM / 100:D2}:{HardFlattenHHMM % 100:D2} ET reached");
         }
 
         private void Lockout(string reason)
@@ -1397,12 +1422,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool TradeTenAm { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Trade 14:00 ET", Description = "Hunt the opening-candle breakout at 14:00 ET (session begin + 20h).", GroupName = "01. Sessions", Order = 4)]
-        public bool TradeTwoPm { get; set; }
+        [Display(Name = "Trade 11:00 ET", Description = "Hunt the opening-candle breakout at 11:00 ET (session begin + 17h).", GroupName = "01. Sessions", Order = 4)]
+        public bool TradeElevenAm { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trade 15:50 ET", Description = "Hunt the opening-candle breakout at 15:50 ET (session begin + 21h50m). The hard flatten at 16:15 bounds this one.", GroupName = "01. Sessions", Order = 5)]
+        public bool TradeThreeFifty { get; set; }
 
         [NinjaScriptProperty, Range(1, 480)]
-        [Display(Name = "Entry window (minutes)", Description = "Hunt breaks/entries only this long after each window opens. An OPEN position is never closed by this clock — it runs to stop/target. A window that opens while a position is still on is skipped.", GroupName = "01. Sessions", Order = 5)]
+        [Display(Name = "Entry window (minutes)", Description = "Hunt breaks/entries only this long after each window opens. An OPEN position is never closed by this clock — it runs to stop/target (or the hard flatten). A window that opens while a position is still on is skipped.", GroupName = "01. Sessions", Order = 6)]
         public int EntryWindowMinutes { get; set; }
+
+        [NinjaScriptProperty, Range(1, 2359)]
+        [Display(Name = "Hard flatten (HHmm ET)", Description = "Wall-clock cutoff, ET, as HHmm (1615 = 16:15). At this time every position is flattened, pending hunts are abandoned and no window arms until the next session. Mandatory: it cannot be switched off, only moved.", GroupName = "01. Sessions", Order = 7)]
+        public int HardFlattenHHMM { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Use whipsaw filter", Description = "OFF = naive chase at the break print (research: -$110/trade avg). ON = hold+extension confirmation with re-entry veto.", GroupName = "02. Signal", Order = 0)]
